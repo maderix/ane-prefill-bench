@@ -54,6 +54,7 @@ static double ticks_to_ms(uint64_t t) {
 #define CONV_K      4
 #define ROPE_PAIRS  64
 #define ROPE_DIM    128
+#define CHUNK       256
 #define CHUNK_C     64
 #define DN_DECAY    0.99f
 #define ATTN_INTERVAL 4
@@ -488,6 +489,8 @@ static const char *tn_ffn_norm(int l) { snprintf(_tn,256,"blk.%d.post_attention_
     "{\"coremlc-version\", \"3505.4.1\"}, {\"coremltools-component-milinternal\", \"\"}, " \
     "{\"coremltools-version\", \"9.0\"}})]\n{\n"
 
+typedef struct { _Float16 *data; int ic, oc; } PreTransW;
+
 static ANEKernelHandle *compile_dyn_proj(int ic, int oc, int sp) {
     int spw = sp + oc;
     char mil[4096];
@@ -527,6 +530,191 @@ static ANEKernelHandle *compile_dyn_proj(int ic, int oc, int sp) {
                                              1, &isz, 1, &osz);
     if (!k) printf("  COMPILE FAILED: proj [%d → %d] sp=%d\n", ic, oc, sp);
     return k;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Fused QKV projection — 4 parallel matmuls in 1 MIL graph
+// Input: [1, IC, 1, SP + Q_DIM + Q_DIM + KV_DIM + KV_DIM]
+//   sp[0:SP] = activation, sp[SP:] = Wq, Wgate, Wk, Wv packed
+// Output: [1, 2*Q_DIM + 2*KV_DIM, 1, SP]
+//   concat(Q, gate, K, V) in channels
+// ═══════════════════════════════════════════════════════════════════
+
+static ANEKernelHandle *compile_fused_qkv(int ic, int q_dim, int kv_dim, int sp) {
+    int sp_total = sp + q_dim + q_dim + kv_dim + kv_dim;
+    int out_ch = 2 * q_dim + 2 * kv_dim;
+    size_t sz = 8192;
+    char *mil = malloc(sz);
+    char *p = mil;
+    int rem = (int)sz, n;
+
+    n = snprintf(p, rem,
+        MIL_HDR
+        "    func main<ios18>(tensor<fp16, [1, %d, 1, %d]> x) {\n"
+        "        tensor<int32, [4]> pm = const()[name=string(\"pm\"), val=tensor<int32, [4]>([0,1,3,2])];\n"
+        "        bool bF = const()[name=string(\"bF\"), val=bool(false)];\n"
+        "        bool bC = const()[name=string(\"bC\"), val=bool(false)];\n"
+        "        int32 cax = const()[name=string(\"cax\"), val=int32(1)];\n",
+        ic, sp_total);
+    p += n; rem -= n;
+
+    // Slice activation [1, IC, 1, SP]
+    n = snprintf(p, rem,
+        "        tensor<int32, [4]> ba = const()[name=string(\"ba\"), val=tensor<int32, [4]>([0,0,0,0])];\n"
+        "        tensor<int32, [4]> sa = const()[name=string(\"sa\"), val=tensor<int32, [4]>([1,%d,1,%d])];\n"
+        "        tensor<fp16, [1,%d,1,%d]> act = slice_by_size(x=x,begin=ba,size=sa)[name=string(\"act\")];\n",
+        ic, sp, ic, sp);
+    p += n; rem -= n;
+
+    // Reshape + transpose activation: [1,1,IC,SP] → [1,1,SP,IC]
+    n = snprintf(p, rem,
+        "        tensor<int32, [4]> ra = const()[name=string(\"ra\"), val=tensor<int32, [4]>([1,1,%d,%d])];\n"
+        "        tensor<fp16, [1,1,%d,%d]> a2 = reshape(shape=ra,x=act)[name=string(\"a2\")];\n"
+        "        tensor<fp16, [1,1,%d,%d]> at = transpose(perm=pm,x=a2)[name=string(\"at\")];\n",
+        ic, sp, ic, sp, sp, ic);
+    p += n; rem -= n;
+
+    // Helper macro-like: for each weight, slice + reshape + matmul + transpose + reshape
+    struct { const char *pfx; int oc; int sp_off; } projs[] = {
+        {"q",  q_dim,  sp},
+        {"g",  q_dim,  sp + q_dim},
+        {"k",  kv_dim, sp + 2*q_dim},
+        {"v",  kv_dim, sp + 2*q_dim + kv_dim},
+    };
+
+    for (int i = 0; i < 4; i++) {
+        const char *pfx = projs[i].pfx;
+        int oc = projs[i].oc;
+        int off = projs[i].sp_off;
+
+        n = snprintf(p, rem,
+            "        tensor<int32, [4]> b%s = const()[name=string(\"b%s\"), val=tensor<int32, [4]>([0,0,0,%d])];\n"
+            "        tensor<int32, [4]> s%s = const()[name=string(\"s%s\"), val=tensor<int32, [4]>([1,%d,1,%d])];\n"
+            "        tensor<fp16, [1,%d,1,%d]> w%s = slice_by_size(x=x,begin=b%s,size=s%s)[name=string(\"w%s\")];\n"
+            "        tensor<int32, [4]> r%s = const()[name=string(\"r%s\"), val=tensor<int32, [4]>([1,1,%d,%d])];\n"
+            "        tensor<fp16, [1,1,%d,%d]> W%s = reshape(shape=r%s,x=w%s)[name=string(\"W%s\")];\n"
+            "        tensor<fp16, [1,1,%d,%d]> y%s = matmul(transpose_x=bF,transpose_y=bF,x=at,y=W%s)[name=string(\"y%s\")];\n"
+            "        tensor<fp16, [1,1,%d,%d]> t%s = transpose(perm=pm,x=y%s)[name=string(\"t%s\")];\n"
+            "        tensor<int32, [4]> o%s = const()[name=string(\"o%s\"), val=tensor<int32, [4]>([1,%d,1,%d])];\n"
+            "        tensor<fp16, [1,%d,1,%d]> %s = reshape(shape=o%s,x=t%s)[name=string(\"%s\")];\n",
+            pfx, pfx, off,
+            pfx, pfx, ic, oc,
+            ic, oc, pfx, pfx, pfx, pfx,
+            pfx, pfx, ic, oc,
+            ic, oc, pfx, pfx, pfx, pfx,
+            sp, oc, pfx, pfx, pfx,
+            oc, sp, pfx, pfx, pfx,
+            pfx, pfx, oc, sp,
+            oc, sp, pfx, pfx, pfx, pfx);
+        p += n; rem -= n;
+    }
+
+    // Concat all 4 outputs along channel dim
+    n = snprintf(p, rem,
+        "        tensor<fp16, [1,%d,1,%d]> y = concat(values=(q,g,k,v),axis=cax,interleave=bC)[name=string(\"y\")];\n"
+        "    } -> (y);\n}\n",
+        out_ch, sp);
+    p += n; rem -= n;
+
+    size_t isz = (size_t)ic * sp_total * 2;
+    size_t osz = (size_t)out_ch * sp * 2;
+    ANEKernelHandle *kern = ane_bridge_compile(mil, strlen(mil), NULL, 0,
+                                                1, &isz, 1, &osz);
+    free(mil);
+    if (!kern) printf("  COMPILE FAILED: fused_qkv [%d → %d+%d+%d+%d] sp=%d\n",
+                      ic, q_dim, q_dim, kv_dim, kv_dim, sp);
+    return kern;
+}
+
+static void fast_stage_fused_qkv(ANEKernelHandle *kern,
+    const PreTransW *pw_q, const PreTransW *pw_gate,
+    const PreTransW *pw_k, const PreTransW *pw_v,
+    const _Float16 *acts_f16, int sp)
+{
+    int ic = pw_q->ic;
+    int q_dim = pw_q->oc, kv_dim = pw_k->oc;
+    int sp_total = sp + q_dim + q_dim + kv_dim + kv_dim;
+    IOSurfaceRef inSurf = (IOSurfaceRef)ane_bridge_get_input_surface(kern, 0);
+    IOSurfaceLock(inSurf, 0, NULL);
+    _Float16 *buf = (_Float16 *)IOSurfaceGetBaseAddress(inSurf);
+
+    int nblk = (ic + 255) / 256;
+    dispatch_apply((size_t)nblk,
+        dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(size_t b) {
+        int d0 = (int)b * 256;
+        int d1 = d0 + 256 < ic ? d0 + 256 : ic;
+        for (int d = d0; d < d1; d++) {
+            _Float16 *row = buf + d * sp_total;
+            memcpy(row, acts_f16 + d * sp, sp * sizeof(_Float16));
+            memcpy(row + sp, pw_q->data + d * q_dim, q_dim * sizeof(_Float16));
+            memcpy(row + sp + q_dim, pw_gate->data + d * q_dim, q_dim * sizeof(_Float16));
+            memcpy(row + sp + 2*q_dim, pw_k->data + d * kv_dim, kv_dim * sizeof(_Float16));
+            memcpy(row + sp + 2*q_dim + kv_dim, pw_v->data + d * kv_dim, kv_dim * sizeof(_Float16));
+        }
+    });
+    IOSurfaceUnlock(inSurf, 0, NULL);
+}
+
+static inline void read_transposed_block(float *dst, const _Float16 *src,
+                                          int oc, int sp, int ch_off) {
+    const _Float16 *base = src + ch_off * sp;
+    int nblk = (oc + 63) / 64;
+    dispatch_apply((size_t)nblk,
+        dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(size_t b) {
+        int c0 = (int)b * 64;
+        int c1 = c0 + 64 < oc ? c0 + 64 : oc;
+        for (int c = c0; c < c1; c++) {
+            const _Float16 *row = base + c * sp;
+            int t = 0;
+            for (; t + 7 < sp; t += 8) {
+                float16x8_t h = vld1q_f16((const __fp16 *)(row + t));
+                float32x4_t lo = vcvt_f32_f16(vget_low_f16(h));
+                float32x4_t hi = vcvt_f32_f16(vget_high_f16(h));
+                dst[(t+0)*oc+c] = vgetq_lane_f32(lo, 0);
+                dst[(t+1)*oc+c] = vgetq_lane_f32(lo, 1);
+                dst[(t+2)*oc+c] = vgetq_lane_f32(lo, 2);
+                dst[(t+3)*oc+c] = vgetq_lane_f32(lo, 3);
+                dst[(t+4)*oc+c] = vgetq_lane_f32(hi, 0);
+                dst[(t+5)*oc+c] = vgetq_lane_f32(hi, 1);
+                dst[(t+6)*oc+c] = vgetq_lane_f32(hi, 2);
+                dst[(t+7)*oc+c] = vgetq_lane_f32(hi, 3);
+            }
+            for (; t < sp; t++)
+                dst[t * oc + c] = (float)row[t];
+        }
+    });
+}
+
+static void read_fused_qkv_output(ANEKernelHandle *kern,
+    float *q, float *gate, float *k, float *v,
+    int q_dim, int kv_dim, int sp)
+{
+    IOSurfaceRef outS = (IOSurfaceRef)ane_bridge_get_output_surface(kern, 0);
+    IOSurfaceLock(outS, kIOSurfaceLockReadOnly, NULL);
+    const _Float16 *src = (const _Float16 *)IOSurfaceGetBaseAddress(outS);
+
+    read_transposed_block(q,    src, q_dim,  sp, 0);
+    read_transposed_block(gate, src, q_dim,  sp, q_dim);
+    read_transposed_block(k,    src, kv_dim, sp, 2 * q_dim);
+    read_transposed_block(v,    src, kv_dim, sp, 2 * q_dim + kv_dim);
+
+    IOSurfaceUnlock(outS, kIOSurfaceLockReadOnly, NULL);
+}
+
+// Deinterleave Q weight: [DIM, ATTN_Q_PROJ] interleaved → [DIM, Q_DIM] Q-only + [DIM, Q_DIM] gate-only
+static void deinterleave_q_weight(const _Float16 *raw, _Float16 *q_out, _Float16 *gate_out,
+                                   int dim, int attn_q_proj, int hq, int hd) {
+    int q_dim = hq * hd;
+    for (int d = 0; d < dim; d++) {
+        for (int h = 0; h < hq; h++) {
+            memcpy(q_out + d * q_dim + h * hd,
+                   raw + d * attn_q_proj + 2*h * hd,
+                   hd * sizeof(_Float16));
+            memcpy(gate_out + d * q_dim + h * hd,
+                   raw + d * attn_q_proj + (2*h+1) * hd,
+                   hd * sizeof(_Float16));
+        }
+    }
 }
 
 // Conv1x1 dynamic weight kernel — 4× faster than matmul MIL at large shapes
@@ -575,8 +763,6 @@ static ANEKernelHandle *compile_dyn_conv(int ic, int oc, int sp) {
 // ═══════════════════════════════════════════════════════════════════
 // Pre-dequant + pre-transpose for fast weight staging
 // ═══════════════════════════════════════════════════════════════════
-
-typedef struct { _Float16 *data; int ic, oc; } PreTransW;
 
 static void transpose_fp16_blocked(_Float16 *dst, const _Float16 *src, int rows, int cols) {
     int nr = (rows + 31) / 32;
@@ -1165,6 +1351,901 @@ static void cpu_attn_output_gate(float *out, const float *gate, int sp) {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// ANE Fused Causal Attention (replaces CPU BLAS attention)
+// Single input: [1, Q_DIM+2*KV_DIM, 1, SEQ] — Q/K/V packed in channels
+// Output:       [1, Q_DIM, 1, SEQ]
+// Causal mask baked as BLOBFILE const (128-byte header format)
+// NOTE: must use single input — ANE matmul after GQA concat fails
+//       when operands trace to different IOSurfaces (status 0x1d)
+// ═══════════════════════════════════════════════════════════════════
+
+static ANEKernelHandle *k_fused_sdpa = NULL;
+
+static char *gen_fused_sdpa_attn(int hq, int hkv, int hd, int seq, size_t *out_len) {
+    int q_dim = hq * hd;
+    int kv_dim = hkv * hd;
+    int total_ch = q_dim + 2 * kv_dim;
+    int gqa = hq / hkv;
+    float scale = 1.0f / sqrtf((float)hd);
+
+    size_t sz = 16384;
+    char *mil = malloc(sz);
+    char *p = mil;
+    int rem = (int)sz, n;
+
+    n = snprintf(p, rem,
+        MIL_HDR
+        "  func main<ios18>(tensor<fp16, [1, %d, 1, %d]> x) {\n"
+        "    tensor<int32, [4]> pm = const()[name=string(\"pm\"), val=tensor<int32, [4]>([0, 1, 3, 2])];\n"
+        "    bool bF = const()[name=string(\"bF\"), val=bool(false)];\n"
+        "    bool bT = const()[name=string(\"bT\"), val=bool(true)];\n",
+        total_ch, seq);
+    p += n; rem -= n;
+
+    // Slice Q [1, q_dim, 1, seq] — channels [0, q_dim)
+    n = snprintf(p, rem,
+        "    tensor<int32, [4]> bq = const()[name=string(\"bq\"), val=tensor<int32, [4]>([0, 0, 0, 0])];\n"
+        "    tensor<int32, [4]> sq = const()[name=string(\"sq\"), val=tensor<int32, [4]>([1, %d, 1, %d])];\n"
+        "    tensor<fp16, [1, %d, 1, %d]> Qf = slice_by_size(x=x, begin=bq, size=sq)[name=string(\"Qf\")];\n",
+        q_dim, seq, q_dim, seq);
+    p += n; rem -= n;
+
+    // Slice K [1, kv_dim, 1, seq] — channels [q_dim, q_dim+kv_dim)
+    n = snprintf(p, rem,
+        "    tensor<int32, [4]> bk = const()[name=string(\"bk\"), val=tensor<int32, [4]>([0, %d, 0, 0])];\n"
+        "    tensor<int32, [4]> sk = const()[name=string(\"sk\"), val=tensor<int32, [4]>([1, %d, 1, %d])];\n"
+        "    tensor<fp16, [1, %d, 1, %d]> Kf = slice_by_size(x=x, begin=bk, size=sk)[name=string(\"Kf\")];\n",
+        q_dim, kv_dim, seq, kv_dim, seq);
+    p += n; rem -= n;
+
+    // Slice V [1, kv_dim, 1, seq] — channels [q_dim+kv_dim, ...)
+    n = snprintf(p, rem,
+        "    tensor<int32, [4]> bv = const()[name=string(\"bv\"), val=tensor<int32, [4]>([0, %d, 0, 0])];\n"
+        "    tensor<fp16, [1, %d, 1, %d]> Vf = slice_by_size(x=x, begin=bv, size=sk)[name=string(\"Vf\")];\n",
+        q_dim + kv_dim, kv_dim, seq);
+    p += n; rem -= n;
+
+    // Reshape Q → [1, hq, hd, seq], transpose → [1, hq, seq, hd]
+    n = snprintf(p, rem,
+        "    tensor<int32, [4]> rq = const()[name=string(\"rq\"), val=tensor<int32, [4]>([1, %d, %d, %d])];\n"
+        "    tensor<fp16, [1, %d, %d, %d]> Qr = reshape(shape=rq, x=Qf)[name=string(\"Qr\")];\n"
+        "    tensor<fp16, [1, %d, %d, %d]> Q = transpose(perm=pm, x=Qr)[name=string(\"Q\")];\n",
+        hq, hd, seq, hq, hd, seq, hq, seq, hd);
+    p += n; rem -= n;
+
+    // Reshape K → [1, hkv, hd, seq], transpose → [1, hkv, seq, hd]
+    n = snprintf(p, rem,
+        "    tensor<int32, [4]> rk = const()[name=string(\"rk\"), val=tensor<int32, [4]>([1, %d, %d, %d])];\n"
+        "    tensor<fp16, [1, %d, %d, %d]> Kr = reshape(shape=rk, x=Kf)[name=string(\"Kr\")];\n"
+        "    tensor<fp16, [1, %d, %d, %d]> K0 = transpose(perm=pm, x=Kr)[name=string(\"K0\")];\n",
+        hkv, hd, seq, hkv, hd, seq, hkv, seq, hd);
+    p += n; rem -= n;
+
+    // Reshape V → [1, hkv, hd, seq], transpose → [1, hkv, seq, hd]
+    n = snprintf(p, rem,
+        "    tensor<fp16, [1, %d, %d, %d]> Vr = reshape(shape=rk, x=Vf)[name=string(\"Vr\")];\n"
+        "    tensor<fp16, [1, %d, %d, %d]> V0 = transpose(perm=pm, x=Vr)[name=string(\"V0\")];\n",
+        hkv, hd, seq, hkv, seq, hd);
+    p += n; rem -= n;
+
+    // GQA tiling: concat K/V gqa_ratio times along axis 1
+    {
+        char args[512];
+        char *ap = args;
+        for (int i = 0; i < gqa; i++) {
+            if (i > 0) ap += snprintf(ap, 512 - (ap - args), ", ");
+            ap += snprintf(ap, 512 - (ap - args), "K0");
+        }
+        n = snprintf(p, rem,
+            "    int32 ax1 = const()[name=string(\"ax1\"), val=int32(1)];\n"
+            "    tensor<fp16, [1, %d, %d, %d]> Kt = concat(values=(%s), axis=ax1, interleave=bT)[name=string(\"Kt\")];\n",
+            hq, seq, hd, args);
+        p += n; rem -= n;
+
+        ap = args;
+        for (int i = 0; i < gqa; i++) {
+            if (i > 0) ap += snprintf(ap, 512 - (ap - args), ", ");
+            ap += snprintf(ap, 512 - (ap - args), "V0");
+        }
+        n = snprintf(p, rem,
+            "    tensor<fp16, [1, %d, %d, %d]> Vt = concat(values=(%s), axis=ax1, interleave=bT)[name=string(\"Vt\")];\n",
+            hq, seq, hd, args);
+        p += n; rem -= n;
+    }
+
+    // QK^T → scale → causal mask → softmax → PV
+    n = snprintf(p, rem,
+        "    tensor<fp16, [1, %d, %d, %d]> sc1 = matmul(transpose_x=bF, transpose_y=bT, x=Q, y=Kt)[name=string(\"sc1\")];\n"
+        "    fp16 scv = const()[name=string(\"scv\"), val=fp16(%f)];\n"
+        "    tensor<fp16, [1, %d, %d, %d]> sc2 = mul(x=sc1, y=scv)[name=string(\"sc2\")];\n"
+        "    tensor<fp16, [1, 1, %d, %d]> cm = const()[name=string(\"cm\"), val=tensor<fp16, [1, 1, %d, %d]>(BLOBFILE(path=string(\"@model_path/weights/weight.bin\"), offset=uint64(64)))];\n"
+        "    tensor<fp16, [1, %d, %d, %d]> ms = add(x=sc2, y=cm)[name=string(\"ms\")];\n"
+        "    int32 axn = const()[name=string(\"axn\"), val=int32(-1)];\n"
+        "    tensor<fp16, [1, %d, %d, %d]> aw = softmax(axis=axn, x=ms)[name=string(\"aw\")];\n"
+        "    tensor<fp16, [1, %d, %d, %d]> av = matmul(transpose_x=bF, transpose_y=bF, x=aw, y=Vt)[name=string(\"av\")];\n",
+        hq, seq, seq, scale,
+        hq, seq, seq,
+        seq, seq, seq, seq,
+        hq, seq, seq,
+        hq, seq, seq,
+        hq, seq, hd);
+    p += n; rem -= n;
+
+    // Transpose back → reshape to flat output
+    n = snprintf(p, rem,
+        "    tensor<fp16, [1, %d, %d, %d]> avt = transpose(perm=pm, x=av)[name=string(\"avt\")];\n"
+        "    tensor<int32, [4]> ro = const()[name=string(\"ro\"), val=tensor<int32, [4]>([1, %d, 1, %d])];\n"
+        "    tensor<fp16, [1, %d, 1, %d]> y = reshape(shape=ro, x=avt)[name=string(\"y\")];\n"
+        "  } -> (y);\n}\n",
+        hq, hd, seq,
+        q_dim, seq, q_dim, seq);
+    p += n; rem -= n;
+
+    *out_len = (size_t)(p - mil);
+    return mil;
+}
+
+static ANEKernelHandle *compile_fused_sdpa(int hq, int hkv, int hd, int seq) {
+    size_t mil_len;
+    char *mil = gen_fused_sdpa_attn(hq, hkv, hd, seq, &mil_len);
+
+    // Build causal mask blob: 128-byte header (DEADBEEF format) + [seq,seq] fp16
+    int mask_elems = seq * seq;
+    _Float16 *mask_data = (_Float16 *)calloc(mask_elems, sizeof(_Float16));
+    for (int i = 0; i < seq; i++)
+        for (int j = 0; j < seq; j++)
+            mask_data[i * seq + j] = (j <= i) ? (_Float16)0.0f : (_Float16)(-65504.0f);
+    int ws = mask_elems * 2;
+    size_t blob_sz = 128 + ws;
+    uint8_t *blob = (uint8_t *)calloc(1, blob_sz);
+    blob[0] = 1; blob[4] = 2;
+    blob[64] = 0xEF; blob[65] = 0xBE; blob[66] = 0xAD; blob[67] = 0xDE; blob[68] = 1;
+    *(uint32_t *)(blob + 72) = ws;
+    *(uint32_t *)(blob + 80) = 128;
+    memcpy(blob + 128, mask_data, ws);
+    free(mask_data);
+
+    int q_dim = hq * hd;
+    int kv_dim = hkv * hd;
+    int total_ch = q_dim + 2 * kv_dim;
+    size_t in_sz = (size_t)total_ch * seq * sizeof(_Float16);
+    size_t out_sz = (size_t)q_dim * seq * sizeof(_Float16);
+
+    const char *wname = "@model_path/weights/weight.bin";
+    const uint8_t *wdata = blob;
+    size_t wlen = blob_sz;
+
+    ANEKernelHandle *k = ane_bridge_compile_multi_weights(
+        mil, mil_len, &wname, &wdata, &wlen, 1,
+        1, &in_sz, 1, &out_sz);
+    free(mil);
+    free(blob);
+    if (!k) fprintf(stderr, "FAILED to compile fused SDPA (hq=%d hkv=%d hd=%d seq=%d)\n",
+                    hq, hkv, hd, seq);
+    return k;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Fully fused QKV + QK RMSNorm + RoPE + causal SDPA
+// Single ANE dispatch: QKV proj → per-head RMSNorm → partial RoPE →
+// GQA concat → causal attention → output + gate
+// Eliminates intermediate FP32 read/re-stage cycle
+// ═══════════════════════════════════════════════════════════════════
+
+static ANEKernelHandle *k_fused_qkv_sdpa[N_ATTN] = {0};
+
+static uint8_t *build_weight_blob(const void *data, size_t data_bytes, size_t *blob_size) {
+    size_t bsz = 128 + data_bytes;
+    uint8_t *blob = (uint8_t *)calloc(1, bsz);
+    blob[0] = 1; blob[4] = 2;
+    blob[64] = 0xEF; blob[65] = 0xBE; blob[66] = 0xAD; blob[67] = 0xDE; blob[68] = 1;
+    *(uint32_t *)(blob + 72) = (uint32_t)data_bytes;
+    *(uint32_t *)(blob + 80) = 128;
+    memcpy(blob + 128, data, data_bytes);
+    *blob_size = bsz;
+    return blob;
+}
+
+static char *gen_fused_qkv_sdpa_attn(size_t *out_len) {
+    int sp_total = CHUNK + Q_DIM + Q_DIM + KV_DIM + KV_DIM;
+    int gqa = ATTN_HQ / ATTN_HKV;
+    float scale = 1.0f / sqrtf((float)ATTN_HD);
+    int hd_pass = ATTN_HD - ROPE_DIM;
+    int pairs_q = CHUNK * ROPE_DIM / 2;
+    int pairs_k = CHUNK * ROPE_DIM / 2;
+    int out_ch = 2 * Q_DIM;
+
+    size_t sz = 131072;
+    char *mil = malloc(sz);
+    char *p = mil;
+    int rem = (int)sz, n;
+    #define EMIT(fmt, ...) do { n = snprintf(p, rem, fmt, ##__VA_ARGS__); p += n; rem -= n; } while(0)
+
+    EMIT(MIL_HDR
+        "  func main<ios18>(tensor<fp16, [1, %d, 1, %d]> x) {\n", DIM, sp_total);
+
+    EMIT("    tensor<int32, [4]> pm = const()[name=string(\"pm\"), val=tensor<int32, [4]>([0,1,3,2])];\n"
+         "    bool bF = const()[name=string(\"bF\"), val=bool(false)];\n"
+         "    bool bT = const()[name=string(\"bT\"), val=bool(true)];\n"
+         "    int32 cax = const()[name=string(\"cax\"), val=int32(1)];\n"
+         "    bool bIL = const()[name=string(\"bIL\"), val=bool(true)];\n"
+         "    bool bNI = const()[name=string(\"bNI\"), val=bool(false)];\n");
+
+    EMIT("    tensor<int32, [1]> rax = const()[name=string(\"rax\"), val=tensor<int32, [1]>([1])];\n"
+         "    bool kdt = const()[name=string(\"kdt\"), val=bool(true)];\n"
+         "    fp16 ihd = const()[name=string(\"ihd\"), val=fp16(%g)];\n"
+         "    fp16 epsv = const()[name=string(\"epsv\"), val=fp16(1e-6)];\n"
+         "    fp16 nhalf = const()[name=string(\"nhalf\"), val=fp16(-0.5)];\n",
+         1.0 / ATTN_HD);
+
+    // Norm weights from BLOBFILE (not spatial — sp>14592 triggers ANE eval failure)
+    EMIT("    tensor<fp16, [1,%d,1,1]> qnw = const()[name=string(\"qnw\"), val=tensor<fp16, [1,%d,1,1]>(BLOBFILE(path=string(\"@model_path/weights/q_norm.bin\"), offset=uint64(64)))];\n"
+         "    tensor<fp16, [1,%d,1,1]> knw = const()[name=string(\"knw\"), val=tensor<fp16, [1,%d,1,1]>(BLOBFILE(path=string(\"@model_path/weights/k_norm.bin\"), offset=uint64(64)))];\n",
+         ATTN_HD, ATTN_HD, ATTN_HD, ATTN_HD);
+
+    // Slice activation [1, DIM, 1, CHUNK]
+    EMIT("    tensor<int32, [4]> ba = const()[name=string(\"ba\"), val=tensor<int32, [4]>([0,0,0,0])];\n"
+         "    tensor<int32, [4]> sa = const()[name=string(\"sa\"), val=tensor<int32, [4]>([1,%d,1,%d])];\n"
+         "    tensor<fp16, [1,%d,1,%d]> act = slice_by_size(x=x,begin=ba,size=sa)[name=string(\"act\")];\n",
+         DIM, CHUNK, DIM, CHUNK);
+
+    // Slice weight matrices
+    int w_offs[] = { CHUNK, CHUNK+Q_DIM, CHUNK+2*Q_DIM, CHUNK+2*Q_DIM+KV_DIM };
+    int w_ocs[] = { Q_DIM, Q_DIM, KV_DIM, KV_DIM };
+    const char *w_pfx[] = { "wq", "wg", "wk", "wv" };
+    for (int i = 0; i < 4; i++) {
+        EMIT("    tensor<int32, [4]> b%s = const()[name=string(\"b%s\"), val=tensor<int32, [4]>([0,0,0,%d])];\n"
+             "    tensor<int32, [4]> s%s = const()[name=string(\"s%s\"), val=tensor<int32, [4]>([1,%d,1,%d])];\n"
+             "    tensor<fp16, [1,%d,1,%d]> %s = slice_by_size(x=x,begin=b%s,size=s%s)[name=string(\"%s\")];\n",
+             w_pfx[i], w_pfx[i], w_offs[i],
+             w_pfx[i], w_pfx[i], DIM, w_ocs[i],
+             DIM, w_ocs[i], w_pfx[i], w_pfx[i], w_pfx[i], w_pfx[i]);
+    }
+
+    // Reshape activation for matmul: [1,1,DIM,CHUNK] → [1,1,CHUNK,DIM]
+    EMIT("    tensor<int32, [4]> ra = const()[name=string(\"ra\"), val=tensor<int32, [4]>([1,1,%d,%d])];\n"
+         "    tensor<fp16, [1,1,%d,%d]> a2 = reshape(shape=ra,x=act)[name=string(\"a2\")];\n"
+         "    tensor<fp16, [1,1,%d,%d]> at = transpose(perm=pm,x=a2)[name=string(\"at\")];\n",
+         DIM, CHUNK, DIM, CHUNK, CHUNK, DIM);
+
+    // 4 matmuls: Q, gate, K, V
+    const char *m_pfx[] = { "q", "g", "k", "v" };
+    for (int i = 0; i < 4; i++) {
+        const char *pf = m_pfx[i];
+        int oc = w_ocs[i];
+        EMIT("    tensor<int32, [4]> r%s = const()[name=string(\"r%s\"), val=tensor<int32, [4]>([1,1,%d,%d])];\n"
+             "    tensor<fp16, [1,1,%d,%d]> W%s = reshape(shape=r%s,x=w%s)[name=string(\"W%s\")];\n"
+             "    tensor<fp16, [1,1,%d,%d]> y%s = matmul(transpose_x=bF,transpose_y=bF,x=at,y=W%s)[name=string(\"y%s\")];\n"
+             "    tensor<fp16, [1,1,%d,%d]> t%s = transpose(perm=pm,x=y%s)[name=string(\"t%s\")];\n"
+             "    tensor<int32, [4]> o%s = const()[name=string(\"o%s\"), val=tensor<int32, [4]>([1,%d,1,%d])];\n"
+             "    tensor<fp16, [1,%d,1,%d]> %sp = reshape(shape=o%s,x=t%s)[name=string(\"%sp\")];\n",
+             pf, pf, DIM, oc,
+             DIM, oc, pf, pf, pf, pf,
+             CHUNK, oc, pf, pf, pf,
+             oc, CHUNK, pf, pf, pf,
+             pf, pf, oc, CHUNK,
+             oc, CHUNK, pf, pf, pf, pf);
+    }
+
+    // Per-head QK RMSNorm — Q (24 heads)
+    EMIT("    tensor<int32, [4]> shd = const()[name=string(\"shd\"), val=tensor<int32, [4]>([1,%d,1,%d])];\n",
+         ATTN_HD, CHUNK);
+    for (int h = 0; h < ATTN_HQ; h++) {
+        EMIT("    tensor<int32, [4]> bqh%d = const()[name=string(\"bqh%d\"), val=tensor<int32, [4]>([0,%d,0,0])];\n"
+             "    tensor<fp16, [1,%d,1,%d]> qh%d = slice_by_size(x=qp,begin=bqh%d,size=shd)[name=string(\"qh%d\")];\n"
+             "    tensor<fp16, [1,%d,1,%d]> sq%d = mul(x=qh%d,y=qh%d)[name=string(\"sq%d\")];\n"
+             "    tensor<fp16, [1,1,1,%d]> ss%d = reduce_sum(axes=rax,keep_dims=kdt,x=sq%d)[name=string(\"ss%d\")];\n"
+             "    tensor<fp16, [1,1,1,%d]> ms%d = mul(x=ss%d,y=ihd)[name=string(\"ms%d\")];\n"
+             "    tensor<fp16, [1,1,1,%d]> me%d = add(x=ms%d,y=epsv)[name=string(\"me%d\")];\n"
+             "    tensor<fp16, [1,1,1,%d]> iv%d = pow(x=me%d,y=nhalf)[name=string(\"iv%d\")];\n"
+             "    tensor<fp16, [1,%d,1,%d]> nm%d = mul(x=qh%d,y=iv%d)[name=string(\"nm%d\")];\n"
+             "    tensor<fp16, [1,%d,1,%d]> qn%d = mul(x=nm%d,y=qnw)[name=string(\"qn%d\")];\n",
+             h, h, h * ATTN_HD,
+             ATTN_HD, CHUNK, h, h, h,
+             ATTN_HD, CHUNK, h, h, h, h,
+             CHUNK, h, h, h,
+             CHUNK, h, h, h,
+             CHUNK, h, h, h,
+             CHUNK, h, h, h,
+             ATTN_HD, CHUNK, h, h, h, h,
+             ATTN_HD, CHUNK, h, h, h);
+    }
+    { // Concat Q heads
+        char args[512]; char *ap = args;
+        for (int h = 0; h < ATTN_HQ; h++) {
+            if (h > 0) ap += snprintf(ap, 512-(ap-args), ",");
+            ap += snprintf(ap, 512-(ap-args), "qn%d", h);
+        }
+        EMIT("    tensor<fp16, [1,%d,1,%d]> Qn = concat(values=(%s),axis=cax,interleave=bNI)[name=string(\"Qn\")];\n",
+             Q_DIM, CHUNK, args);
+    }
+
+    // Per-head RMSNorm — K (4 heads)
+    for (int h = 0; h < ATTN_HKV; h++) {
+        EMIT("    tensor<int32, [4]> bkh%d = const()[name=string(\"bkh%d\"), val=tensor<int32, [4]>([0,%d,0,0])];\n"
+             "    tensor<fp16, [1,%d,1,%d]> kh%d = slice_by_size(x=kp,begin=bkh%d,size=shd)[name=string(\"kh%d\")];\n"
+             "    tensor<fp16, [1,%d,1,%d]> ks%d = mul(x=kh%d,y=kh%d)[name=string(\"ks%d\")];\n"
+             "    tensor<fp16, [1,1,1,%d]> kss%d = reduce_sum(axes=rax,keep_dims=kdt,x=ks%d)[name=string(\"kss%d\")];\n"
+             "    tensor<fp16, [1,1,1,%d]> kms%d = mul(x=kss%d,y=ihd)[name=string(\"kms%d\")];\n"
+             "    tensor<fp16, [1,1,1,%d]> kme%d = add(x=kms%d,y=epsv)[name=string(\"kme%d\")];\n"
+             "    tensor<fp16, [1,1,1,%d]> kiv%d = pow(x=kme%d,y=nhalf)[name=string(\"kiv%d\")];\n"
+             "    tensor<fp16, [1,%d,1,%d]> knm%d = mul(x=kh%d,y=kiv%d)[name=string(\"knm%d\")];\n"
+             "    tensor<fp16, [1,%d,1,%d]> kn%d = mul(x=knm%d,y=knw)[name=string(\"kn%d\")];\n",
+             h, h, h * ATTN_HD,
+             ATTN_HD, CHUNK, h, h, h,
+             ATTN_HD, CHUNK, h, h, h, h,
+             CHUNK, h, h, h,
+             CHUNK, h, h, h,
+             CHUNK, h, h, h,
+             CHUNK, h, h, h,
+             ATTN_HD, CHUNK, h, h, h, h,
+             ATTN_HD, CHUNK, h, h, h);
+    }
+    { // Concat K heads
+        char args[128]; char *ap = args;
+        for (int h = 0; h < ATTN_HKV; h++) {
+            if (h > 0) ap += snprintf(ap, 128-(ap-args), ",");
+            ap += snprintf(ap, 128-(ap-args), "kn%d", h);
+        }
+        EMIT("    tensor<fp16, [1,%d,1,%d]> Kn = concat(values=(%s),axis=cax,interleave=bNI)[name=string(\"Kn\")];\n",
+             KV_DIM, CHUNK, args);
+    }
+
+    // Reshape to per-head for RoPE
+    // Q: [1, Q_DIM, 1, CHUNK] → [1, HQ, HD, CHUNK] → [1, HQ, CHUNK, HD]
+    EMIT("    tensor<int32, [4]> rqh = const()[name=string(\"rqh\"), val=tensor<int32, [4]>([1,%d,%d,%d])];\n"
+         "    tensor<fp16, [1,%d,%d,%d]> Qh = reshape(shape=rqh,x=Qn)[name=string(\"Qh\")];\n"
+         "    tensor<fp16, [1,%d,%d,%d]> Q = transpose(perm=pm,x=Qh)[name=string(\"Q\")];\n",
+         ATTN_HQ, ATTN_HD, CHUNK,
+         ATTN_HQ, ATTN_HD, CHUNK,
+         ATTN_HQ, CHUNK, ATTN_HD);
+    // K: same
+    EMIT("    tensor<int32, [4]> rkh = const()[name=string(\"rkh\"), val=tensor<int32, [4]>([1,%d,%d,%d])];\n"
+         "    tensor<fp16, [1,%d,%d,%d]> Kh = reshape(shape=rkh,x=Kn)[name=string(\"Kh\")];\n"
+         "    tensor<fp16, [1,%d,%d,%d]> K = transpose(perm=pm,x=Kh)[name=string(\"K\")];\n",
+         ATTN_HKV, ATTN_HD, CHUNK,
+         ATTN_HKV, ATTN_HD, CHUNK,
+         ATTN_HKV, CHUNK, ATTN_HD);
+    // V: [1, KV_DIM, 1, CHUNK] → [1, HKV, CHUNK, HD]
+    EMIT("    tensor<fp16, [1,%d,%d,%d]> Vh = reshape(shape=rkh,x=vp)[name=string(\"Vh\")];\n"
+         "    tensor<fp16, [1,%d,%d,%d]> V = transpose(perm=pm,x=Vh)[name=string(\"V\")];\n",
+         ATTN_HKV, ATTN_HD, CHUNK,
+         ATTN_HKV, CHUNK, ATTN_HD);
+
+    // Partial RoPE: BLOBFILE cos/sin tables [1,1,CHUNK,ROPE_DIM]
+    EMIT("    tensor<fp16, [1,1,%d,%d]> rcos = const()[name=string(\"rc\"), val=tensor<fp16, [1,1,%d,%d]>(BLOBFILE(path=string(\"@model_path/weights/rope_cos.bin\"), offset=uint64(64)))];\n"
+         "    tensor<fp16, [1,1,%d,%d]> rsin = const()[name=string(\"rs\"), val=tensor<fp16, [1,1,%d,%d]>(BLOBFILE(path=string(\"@model_path/weights/rope_sin.bin\"), offset=uint64(64)))];\n",
+         CHUNK, ROPE_DIM, CHUNK, ROPE_DIM,
+         CHUNK, ROPE_DIM, CHUNK, ROPE_DIM);
+
+    EMIT("    fp16 neg1 = const()[name=string(\"neg1\"), val=fp16(-1)];\n"
+         "    int32 rpax = const()[name=string(\"rpax\"), val=int32(3)];\n"
+         "    bool rpil = const()[name=string(\"rpil\"), val=bool(false)];\n");
+
+    // RoPE on Q: slice rotated/pass parts, rotate_half, apply
+    EMIT("    tensor<int32, [4]> brp = const()[name=string(\"brp\"), val=tensor<int32, [4]>([0,0,0,0])];\n"
+         "    tensor<int32, [4]> srpq = const()[name=string(\"srpq\"), val=tensor<int32, [4]>([1,%d,%d,%d])];\n"
+         "    tensor<fp16, [1,%d,%d,%d]> Qr = slice_by_size(x=Q,begin=brp,size=srpq)[name=string(\"Qr\")];\n"
+         "    tensor<int32, [4]> brpp = const()[name=string(\"brpp\"), val=tensor<int32, [4]>([0,0,0,%d])];\n"
+         "    tensor<int32, [4]> srppq = const()[name=string(\"srppq\"), val=tensor<int32, [4]>([1,%d,%d,%d])];\n"
+         "    tensor<fp16, [1,%d,%d,%d]> Qps = slice_by_size(x=Q,begin=brpp,size=srppq)[name=string(\"Qps\")];\n",
+         ATTN_HQ, CHUNK, ROPE_DIM,
+         ATTN_HQ, CHUNK, ROPE_DIM,
+         ROPE_DIM,
+         ATTN_HQ, CHUNK, hd_pass,
+         ATTN_HQ, CHUNK, hd_pass);
+    // rotate_half Q
+    EMIT("    tensor<int32, [4]> rpshq = const()[name=string(\"rpshq\"), val=tensor<int32, [4]>([1,%d,%d,2])];\n"
+         "    tensor<int32, [4]> rps1q = const()[name=string(\"rps1q\"), val=tensor<int32, [4]>([1,%d,%d,1])];\n"
+         "    tensor<int32, [4]> rpb0 = const()[name=string(\"rpb0\"), val=tensor<int32, [4]>([0,0,0,0])];\n"
+         "    tensor<int32, [4]> rpb1 = const()[name=string(\"rpb1\"), val=tensor<int32, [4]>([0,0,0,1])];\n"
+         "    tensor<int32, [4]> rpbkq = const()[name=string(\"rpbkq\"), val=tensor<int32, [4]>([1,%d,%d,%d])];\n",
+         ATTN_HQ, pairs_q,
+         ATTN_HQ, pairs_q,
+         ATTN_HQ, CHUNK, ROPE_DIM);
+    EMIT("    tensor<fp16, [1,%d,%d,2]> qp2 = reshape(shape=rpshq,x=Qr)[name=string(\"qp2\")];\n"
+         "    tensor<fp16, [1,%d,%d,1]> qev = slice_by_size(x=qp2,begin=rpb0,size=rps1q)[name=string(\"qev\")];\n"
+         "    tensor<fp16, [1,%d,%d,1]> qod = slice_by_size(x=qp2,begin=rpb1,size=rps1q)[name=string(\"qod\")];\n"
+         "    tensor<fp16, [1,%d,%d,1]> nqo = mul(x=qod,y=neg1)[name=string(\"nqo\")];\n"
+         "    tensor<fp16, [1,%d,%d,2]> qrp = concat(axis=rpax,interleave=rpil,values=(nqo,qev))[name=string(\"qrp\")];\n"
+         "    tensor<fp16, [1,%d,%d,%d]> Qrot = reshape(shape=rpbkq,x=qrp)[name=string(\"Qrot\")];\n",
+         ATTN_HQ, pairs_q,
+         ATTN_HQ, pairs_q,
+         ATTN_HQ, pairs_q,
+         ATTN_HQ, pairs_q,
+         ATTN_HQ, pairs_q,
+         ATTN_HQ, CHUNK, ROPE_DIM);
+    EMIT("    tensor<fp16, [1,%d,%d,%d]> qrc = mul(x=Qr,y=rcos)[name=string(\"qrc\")];\n"
+         "    tensor<fp16, [1,%d,%d,%d]> qrs = mul(x=Qrot,y=rsin)[name=string(\"qrs\")];\n"
+         "    tensor<fp16, [1,%d,%d,%d]> Qroped = add(x=qrc,y=qrs)[name=string(\"Qroped\")];\n"
+         "    tensor<fp16, [1,%d,%d,%d]> Qfin = concat(axis=rpax,interleave=rpil,values=(Qroped,Qps))[name=string(\"Qfin\")];\n",
+         ATTN_HQ, CHUNK, ROPE_DIM,
+         ATTN_HQ, CHUNK, ROPE_DIM,
+         ATTN_HQ, CHUNK, ROPE_DIM,
+         ATTN_HQ, CHUNK, ATTN_HD);
+
+    // RoPE on K
+    EMIT("    tensor<int32, [4]> srpk = const()[name=string(\"srpk\"), val=tensor<int32, [4]>([1,%d,%d,%d])];\n"
+         "    tensor<fp16, [1,%d,%d,%d]> Krp = slice_by_size(x=K,begin=brp,size=srpk)[name=string(\"Krp\")];\n"
+         "    tensor<int32, [4]> srppk = const()[name=string(\"srppk\"), val=tensor<int32, [4]>([1,%d,%d,%d])];\n"
+         "    tensor<fp16, [1,%d,%d,%d]> Kps = slice_by_size(x=K,begin=brpp,size=srppk)[name=string(\"Kps\")];\n",
+         ATTN_HKV, CHUNK, ROPE_DIM,
+         ATTN_HKV, CHUNK, ROPE_DIM,
+         ATTN_HKV, CHUNK, hd_pass,
+         ATTN_HKV, CHUNK, hd_pass);
+    EMIT("    tensor<int32, [4]> rpshk = const()[name=string(\"rpshk\"), val=tensor<int32, [4]>([1,%d,%d,2])];\n"
+         "    tensor<int32, [4]> rps1k = const()[name=string(\"rps1k\"), val=tensor<int32, [4]>([1,%d,%d,1])];\n"
+         "    tensor<int32, [4]> rpbkk = const()[name=string(\"rpbkk\"), val=tensor<int32, [4]>([1,%d,%d,%d])];\n",
+         ATTN_HKV, pairs_k,
+         ATTN_HKV, pairs_k,
+         ATTN_HKV, CHUNK, ROPE_DIM);
+    EMIT("    tensor<fp16, [1,%d,%d,2]> kp2 = reshape(shape=rpshk,x=Krp)[name=string(\"kp2\")];\n"
+         "    tensor<fp16, [1,%d,%d,1]> kev = slice_by_size(x=kp2,begin=rpb0,size=rps1k)[name=string(\"kev\")];\n"
+         "    tensor<fp16, [1,%d,%d,1]> kod = slice_by_size(x=kp2,begin=rpb1,size=rps1k)[name=string(\"kod\")];\n"
+         "    tensor<fp16, [1,%d,%d,1]> nko = mul(x=kod,y=neg1)[name=string(\"nko\")];\n"
+         "    tensor<fp16, [1,%d,%d,2]> krp2 = concat(axis=rpax,interleave=rpil,values=(nko,kev))[name=string(\"krp2\")];\n"
+         "    tensor<fp16, [1,%d,%d,%d]> Krot = reshape(shape=rpbkk,x=krp2)[name=string(\"Krot\")];\n",
+         ATTN_HKV, pairs_k,
+         ATTN_HKV, pairs_k,
+         ATTN_HKV, pairs_k,
+         ATTN_HKV, pairs_k,
+         ATTN_HKV, pairs_k,
+         ATTN_HKV, CHUNK, ROPE_DIM);
+    EMIT("    tensor<fp16, [1,%d,%d,%d]> krc = mul(x=Krp,y=rcos)[name=string(\"krc\")];\n"
+         "    tensor<fp16, [1,%d,%d,%d]> krs = mul(x=Krot,y=rsin)[name=string(\"krs\")];\n"
+         "    tensor<fp16, [1,%d,%d,%d]> Kroped = add(x=krc,y=krs)[name=string(\"Kroped\")];\n"
+         "    tensor<fp16, [1,%d,%d,%d]> Kfin = concat(axis=rpax,interleave=rpil,values=(Kroped,Kps))[name=string(\"Kfin\")];\n",
+         ATTN_HKV, CHUNK, ROPE_DIM,
+         ATTN_HKV, CHUNK, ROPE_DIM,
+         ATTN_HKV, CHUNK, ROPE_DIM,
+         ATTN_HKV, CHUNK, ATTN_HD);
+
+    // GQA concat: tile K and V from HKV to HQ heads
+    {
+        char k_args[512], v_args[512];
+        char *kp2 = k_args, *vp2 = v_args;
+        for (int r = 0; r < gqa; r++) {
+            if (r > 0) { kp2 += snprintf(kp2, 512-(kp2-k_args), ","); vp2 += snprintf(vp2, 512-(vp2-v_args), ","); }
+            kp2 += snprintf(kp2, 512-(kp2-k_args), "Kfin"); vp2 += snprintf(vp2, 512-(vp2-v_args), "V");
+        }
+        EMIT("    tensor<fp16, [1,%d,%d,%d]> Kt = concat(values=(%s),axis=cax,interleave=bIL)[name=string(\"Kt\")];\n"
+             "    tensor<fp16, [1,%d,%d,%d]> Vt = concat(values=(%s),axis=cax,interleave=bIL)[name=string(\"Vt\")];\n",
+             ATTN_HQ, CHUNK, ATTN_HD, k_args,
+             ATTN_HQ, CHUNK, ATTN_HD, v_args);
+    }
+
+    // Causal SDPA: QK^T → scale → mask → softmax → PV
+    EMIT("    tensor<fp16, [1,%d,%d,%d]> sc1 = matmul(transpose_x=bF,transpose_y=bT,x=Qfin,y=Kt)[name=string(\"sc1\")];\n"
+         "    fp16 scv = const()[name=string(\"scv\"), val=fp16(%f)];\n"
+         "    tensor<fp16, [1,%d,%d,%d]> sc2 = mul(x=sc1,y=scv)[name=string(\"sc2\")];\n"
+         "    tensor<fp16, [1,1,%d,%d]> cm = const()[name=string(\"cm\"), val=tensor<fp16, [1,1,%d,%d]>(BLOBFILE(path=string(\"@model_path/weights/mask.bin\"), offset=uint64(64)))];\n"
+         "    tensor<fp16, [1,%d,%d,%d]> msk = add(x=sc2,y=cm)[name=string(\"msk\")];\n"
+         "    int32 sax = const()[name=string(\"sax\"), val=int32(-1)];\n"
+         "    tensor<fp16, [1,%d,%d,%d]> aw = softmax(axis=sax,x=msk)[name=string(\"aw\")];\n"
+         "    tensor<fp16, [1,%d,%d,%d]> av = matmul(transpose_x=bF,transpose_y=bF,x=aw,y=Vt)[name=string(\"av\")];\n",
+         ATTN_HQ, CHUNK, CHUNK, scale,
+         ATTN_HQ, CHUNK, CHUNK,
+         CHUNK, CHUNK, CHUNK, CHUNK,
+         ATTN_HQ, CHUNK, CHUNK,
+         ATTN_HQ, CHUNK, CHUNK,
+         ATTN_HQ, CHUNK, ATTN_HD);
+
+    // Output: transpose attn_out back, reshape, concat with gate
+    EMIT("    tensor<fp16, [1,%d,%d,%d]> avt = transpose(perm=pm,x=av)[name=string(\"avt\")];\n"
+         "    tensor<int32, [4]> rout = const()[name=string(\"rout\"), val=tensor<int32, [4]>([1,%d,1,%d])];\n"
+         "    tensor<fp16, [1,%d,1,%d]> aout = reshape(shape=rout,x=avt)[name=string(\"aout\")];\n"
+         "    tensor<fp16, [1,%d,1,%d]> out = concat(values=(aout,gp),axis=cax,interleave=bNI)[name=string(\"out\")];\n"
+         "  } -> (out);\n}\n",
+         ATTN_HQ, ATTN_HD, CHUNK,
+         Q_DIM, CHUNK,
+         Q_DIM, CHUNK,
+         out_ch, CHUNK);
+
+    #undef EMIT
+    *out_len = (size_t)(p - mil);
+    return mil;
+}
+
+static ANEKernelHandle *compile_fused_qkv_sdpa_kern(
+    const float *q_norm_w_f32, const float *k_norm_w_f32) {
+    size_t mil_len;
+    char *mil = gen_fused_qkv_sdpa_attn(&mil_len);
+
+    // Build causal mask blob [1,1,CHUNK,CHUNK]
+    int mask_elems = CHUNK * CHUNK;
+    _Float16 *mask_data = (_Float16 *)calloc(mask_elems, sizeof(_Float16));
+    for (int i = 0; i < CHUNK; i++)
+        for (int j = 0; j < CHUNK; j++)
+            mask_data[i * CHUNK + j] = (j <= i) ? (_Float16)0.0f : (_Float16)(-65504.0f);
+    size_t mask_bsz;
+    uint8_t *mask_blob = build_weight_blob(mask_data, mask_elems * 2, &mask_bsz);
+    free(mask_data);
+
+    // Build RoPE cos/sin blobs [1,1,CHUNK,ROPE_DIM]
+    int rope_elems = CHUNK * ROPE_DIM;
+    _Float16 *cos_data = (_Float16 *)calloc(rope_elems, sizeof(_Float16));
+    _Float16 *sin_data = (_Float16 *)calloc(rope_elems, sizeof(_Float16));
+    for (int pos = 0; pos < CHUNK; pos++) {
+        for (int i = 0; i < ROPE_PAIRS; i++) {
+            float freq = 1.0f / powf(1e7f, (float)(2 * i) / ROPE_DIM);
+            float angle = pos * freq;
+            _Float16 cv = (_Float16)cosf(angle);
+            _Float16 sv = (_Float16)sinf(angle);
+            cos_data[pos * ROPE_DIM + 2*i] = cv;
+            cos_data[pos * ROPE_DIM + 2*i + 1] = cv;
+            sin_data[pos * ROPE_DIM + 2*i] = sv;
+            sin_data[pos * ROPE_DIM + 2*i + 1] = sv;
+        }
+    }
+    size_t cos_bsz, sin_bsz;
+    uint8_t *cos_blob = build_weight_blob(cos_data, rope_elems * 2, &cos_bsz);
+    uint8_t *sin_blob = build_weight_blob(sin_data, rope_elems * 2, &sin_bsz);
+    free(cos_data); free(sin_data);
+
+    int sp_total = CHUNK + Q_DIM + Q_DIM + KV_DIM + KV_DIM;
+    size_t in_sz = (size_t)DIM * sp_total * sizeof(_Float16);
+    int out_ch = 2 * Q_DIM;
+    size_t out_sz = (size_t)out_ch * CHUNK * sizeof(_Float16);
+
+    _Float16 *qnw_data = (_Float16 *)calloc(ATTN_HD, sizeof(_Float16));
+    _Float16 *knw_data = (_Float16 *)calloc(ATTN_HD, sizeof(_Float16));
+    for (int i = 0; i < ATTN_HD; i++) {
+        qnw_data[i] = (_Float16)q_norm_w_f32[i];
+        knw_data[i] = (_Float16)k_norm_w_f32[i];
+    }
+    size_t qnw_bsz, knw_bsz;
+    uint8_t *qnw_blob = build_weight_blob(qnw_data, ATTN_HD * 2, &qnw_bsz);
+    uint8_t *knw_blob = build_weight_blob(knw_data, ATTN_HD * 2, &knw_bsz);
+    free(qnw_data); free(knw_data);
+
+    const char *wnames[] = {
+        "@model_path/weights/mask.bin",
+        "@model_path/weights/rope_cos.bin",
+        "@model_path/weights/rope_sin.bin",
+        "@model_path/weights/q_norm.bin",
+        "@model_path/weights/k_norm.bin"
+    };
+    const uint8_t *wdatas[] = { mask_blob, cos_blob, sin_blob, qnw_blob, knw_blob };
+    size_t wlens[] = { mask_bsz, cos_bsz, sin_bsz, qnw_bsz, knw_bsz };
+
+    ANEKernelHandle *k = ane_bridge_compile_multi_weights(
+        mil, mil_len, wnames, wdatas, wlens, 5,
+        1, &in_sz, 1, &out_sz);
+
+    free(mil); free(mask_blob); free(cos_blob); free(sin_blob);
+    free(qnw_blob); free(knw_blob);
+    if (!k) fprintf(stderr, "FAILED to compile fused QKV+SDPA\n");
+    else fprintf(stderr, "  Compiled fused QKV+SDPA (%zu bytes MIL)\n", mil_len);
+    return k;
+}
+
+static void fast_stage_fused_qkv_sdpa(ANEKernelHandle *kern,
+    const PreTransW *pw_q, const PreTransW *pw_gate,
+    const PreTransW *pw_k, const PreTransW *pw_v,
+    const _Float16 *acts_f16, int sp)
+{
+    int ic = pw_q->ic;
+    int q_dim = pw_q->oc, kv_dim = pw_k->oc;
+    int sp_total = sp + q_dim + q_dim + kv_dim + kv_dim;
+    IOSurfaceRef inSurf = (IOSurfaceRef)ane_bridge_get_input_surface(kern, 0);
+    IOSurfaceLock(inSurf, 0, NULL);
+    _Float16 *buf = (_Float16 *)IOSurfaceGetBaseAddress(inSurf);
+
+    int nblk = (ic + 255) / 256;
+    dispatch_apply((size_t)nblk,
+        dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(size_t b) {
+        int d0 = (int)b * 256;
+        int d1 = d0 + 256 < ic ? d0 + 256 : ic;
+        for (int d = d0; d < d1; d++) {
+            _Float16 *row = buf + (size_t)d * sp_total;
+            memcpy(row, acts_f16 + d * sp, sp * sizeof(_Float16));
+            memcpy(row + sp, pw_q->data + d * q_dim, q_dim * sizeof(_Float16));
+            memcpy(row + sp + q_dim, pw_gate->data + d * q_dim, q_dim * sizeof(_Float16));
+            memcpy(row + sp + 2*q_dim, pw_k->data + d * kv_dim, kv_dim * sizeof(_Float16));
+            memcpy(row + sp + 2*q_dim + kv_dim, pw_v->data + d * kv_dim, kv_dim * sizeof(_Float16));
+        }
+    });
+    IOSurfaceUnlock(inSurf, 0, NULL);
+}
+
+static void read_fused_qkv_sdpa_output(ANEKernelHandle *kern,
+    float *attn_out, float *gate, int q_dim, int sp)
+{
+    IOSurfaceRef outS = (IOSurfaceRef)ane_bridge_get_output_surface(kern, 0);
+    IOSurfaceLock(outS, kIOSurfaceLockReadOnly, NULL);
+    const _Float16 *src = (const _Float16 *)IOSurfaceGetBaseAddress(outS);
+    read_transposed_block(attn_out, src, q_dim, sp, 0);
+    read_transposed_block(gate, src, q_dim, sp, q_dim);
+    IOSurfaceUnlock(outS, kIOSurfaceLockReadOnly, NULL);
+}
+
+static void stage_fused_sdpa(ANEKernelHandle *kernel,
+                              const float *q, const float *k, const float *v, int sp) {
+    IOSurfaceRef inSurf = (IOSurfaceRef)ane_bridge_get_input_surface(kernel, 0);
+    IOSurfaceLock(inSurf, 0, NULL);
+    _Float16 *buf = (_Float16 *)IOSurfaceGetBaseAddress(inSurf);
+
+    // Q: [sp, Q_DIM] row-major → channels [0, Q_DIM), transposed to [C, S]
+    for (int c = 0; c < Q_DIM; c++)
+        for (int s = 0; s < sp; s++)
+            buf[c * sp + s] = (_Float16)q[s * Q_DIM + c];
+
+    // K: [sp, KV_DIM] → channels [Q_DIM, Q_DIM+KV_DIM)
+    for (int c = 0; c < KV_DIM; c++)
+        for (int s = 0; s < sp; s++)
+            buf[(Q_DIM + c) * sp + s] = (_Float16)k[s * KV_DIM + c];
+
+    // V: [sp, KV_DIM] → channels [Q_DIM+KV_DIM, ...)
+    for (int c = 0; c < KV_DIM; c++)
+        for (int s = 0; s < sp; s++)
+            buf[(Q_DIM + KV_DIM + c) * sp + s] = (_Float16)v[s * KV_DIM + c];
+
+    IOSurfaceUnlock(inSurf, 0, NULL);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// ANE Chunkwise DeltaNet Recurrence (replaces CPU sequential recurrence)
+// Fused 4-matmul chunk kernel: K^T@V, Q@K^T, A@V, Q@S_prev
+// ═══════════════════════════════════════════════════════════════════
+
+static ANEKernelHandle *k_ane_chunk = NULL;
+static _Float16 *g_decay_mask = NULL;
+
+static _Float16 *precompute_decay_mask(int C, float g) {
+    _Float16 *mask = (_Float16 *)malloc((size_t)C * C * sizeof(_Float16));
+    for (int i = 0; i < C; i++)
+        for (int j = 0; j < C; j++)
+            mask[i * C + j] = (j <= i) ? (_Float16)powf(g, (float)(i - j)) : (_Float16)0.0f;
+    return mask;
+}
+
+static char *gen_fused_chunk(int H, int C, int D, float g, size_t *out_len) {
+    int sp_q = C*D, sp_s = D*D, sp_m = C*C;
+    int sp_total = 3*sp_q + sp_s + sp_m;
+    int off_q = 0, off_k = sp_q, off_v = 2*sp_q, off_s = 3*sp_q, off_m = 3*sp_q + sp_s;
+    int sp_out = C*D + D*D;
+
+    size_t sz = 16384;
+    char *mil = malloc(sz);
+    char *p = mil;
+    int rem = (int)sz, n;
+
+    n = snprintf(p, rem,
+        MIL_HDR
+        "  func main<ios18>(tensor<fp16, [1, %d, 1, %d]> x) {\n"
+        "    tensor<int32, [4]> pm = const()[name = string(\"pm\"), val = tensor<int32, [4]>([0, 1, 3, 2])];\n"
+        "    bool bF = const()[name = string(\"bF\"), val = bool(false)];\n"
+        "    tensor<int32, [4]> rcd = const()[name = string(\"rcd\"), val = tensor<int32, [4]>([1, %d, %d, %d])];\n",
+        H, sp_total, H, C, D);
+    p += n; rem -= n;
+
+    // Slice & reshape Q [1,H,C,D]
+    n = snprintf(p, rem,
+        "    tensor<int32, [4]> bq = const()[name = string(\"bq\"), val = tensor<int32, [4]>([0, 0, 0, %d])];\n"
+        "    tensor<int32, [4]> sq = const()[name = string(\"sq\"), val = tensor<int32, [4]>([1, %d, 1, %d])];\n"
+        "    tensor<fp16, [1, %d, 1, %d]> qf = slice_by_size(x = x, begin = bq, size = sq)[name = string(\"qf\")];\n"
+        "    tensor<fp16, [1, %d, %d, %d]> Q = reshape(shape = rcd, x = qf)[name = string(\"Q\")];\n",
+        off_q, H, sp_q, H, sp_q, H, C, D);
+    p += n; rem -= n;
+
+    // Slice & reshape K [1,H,C,D]
+    n = snprintf(p, rem,
+        "    tensor<int32, [4]> bk = const()[name = string(\"bk\"), val = tensor<int32, [4]>([0, 0, 0, %d])];\n"
+        "    tensor<fp16, [1, %d, 1, %d]> kf = slice_by_size(x = x, begin = bk, size = sq)[name = string(\"kf\")];\n"
+        "    tensor<fp16, [1, %d, %d, %d]> K = reshape(shape = rcd, x = kf)[name = string(\"K\")];\n",
+        off_k, H, sp_q, H, C, D);
+    p += n; rem -= n;
+
+    // Slice & reshape V [1,H,C,D]
+    n = snprintf(p, rem,
+        "    tensor<int32, [4]> bv = const()[name = string(\"bv\"), val = tensor<int32, [4]>([0, 0, 0, %d])];\n"
+        "    tensor<fp16, [1, %d, 1, %d]> vf = slice_by_size(x = x, begin = bv, size = sq)[name = string(\"vf\")];\n"
+        "    tensor<fp16, [1, %d, %d, %d]> V = reshape(shape = rcd, x = vf)[name = string(\"V\")];\n",
+        off_v, H, sp_q, H, C, D);
+    p += n; rem -= n;
+
+    // Slice & reshape S_prev [1,H,D,D]
+    n = snprintf(p, rem,
+        "    tensor<int32, [4]> bs = const()[name = string(\"bs\"), val = tensor<int32, [4]>([0, 0, 0, %d])];\n"
+        "    tensor<int32, [4]> ss = const()[name = string(\"ss\"), val = tensor<int32, [4]>([1, %d, 1, %d])];\n"
+        "    tensor<fp16, [1, %d, 1, %d]> sf = slice_by_size(x = x, begin = bs, size = ss)[name = string(\"sf\")];\n"
+        "    tensor<int32, [4]> rdd = const()[name = string(\"rdd\"), val = tensor<int32, [4]>([1, %d, %d, %d])];\n"
+        "    tensor<fp16, [1, %d, %d, %d]> Sp = reshape(shape = rdd, x = sf)[name = string(\"Sp\")];\n",
+        off_s, H, sp_s, H, sp_s, H, D, D, H, D, D);
+    p += n; rem -= n;
+
+    // Slice & reshape Mask [1,H,C,C]
+    n = snprintf(p, rem,
+        "    tensor<int32, [4]> bm = const()[name = string(\"bm\"), val = tensor<int32, [4]>([0, 0, 0, %d])];\n"
+        "    tensor<int32, [4]> sm = const()[name = string(\"sm\"), val = tensor<int32, [4]>([1, %d, 1, %d])];\n"
+        "    tensor<fp16, [1, %d, 1, %d]> mf = slice_by_size(x = x, begin = bm, size = sm)[name = string(\"mf\")];\n"
+        "    tensor<int32, [4]> rcc = const()[name = string(\"rcc\"), val = tensor<int32, [4]>([1, %d, %d, %d])];\n"
+        "    tensor<fp16, [1, %d, %d, %d]> M = reshape(shape = rcc, x = mf)[name = string(\"M\")];\n",
+        off_m, H, sp_m, H, sp_m, H, C, C, H, C, C);
+    p += n; rem -= n;
+
+    // K^T
+    n = snprintf(p, rem,
+        "    tensor<fp16, [1, %d, %d, %d]> KT = transpose(perm = pm, x = K)[name = string(\"KT\")];\n",
+        H, D, C);
+    p += n; rem -= n;
+
+    // dS = K^T @ V  [H,D,C]×[H,C,D] → [H,D,D]
+    n = snprintf(p, rem,
+        "    tensor<fp16, [1, %d, %d, %d]> dS = matmul(transpose_x = bF, transpose_y = bF, x = KT, y = V)[name = string(\"dS\")];\n",
+        H, D, D);
+    p += n; rem -= n;
+
+    // S_next = g^C * S_prev + dS
+    n = snprintf(p, rem,
+        "    fp16 gc = const()[name = string(\"gc\"), val = fp16(%.10f)];\n"
+        "    tensor<fp16, [1, %d, %d, %d]> Sg = mul(x = Sp, y = gc)[name = string(\"Sg\")];\n"
+        "    tensor<fp16, [1, %d, %d, %d]> Sn = add(x = Sg, y = dS)[name = string(\"Sn\")];\n",
+        powf(g, (float)C), H, D, D, H, D, D);
+    p += n; rem -= n;
+
+    // QK^T = Q @ K^T  [H,C,D]×[H,D,C] → [H,C,C]
+    n = snprintf(p, rem,
+        "    tensor<fp16, [1, %d, %d, %d]> qk = matmul(transpose_x = bF, transpose_y = bF, x = Q, y = KT)[name = string(\"qk\")];\n"
+        "    tensor<fp16, [1, %d, %d, %d]> A = mul(x = qk, y = M)[name = string(\"A\")];\n",
+        H, C, C, H, C, C);
+    p += n; rem -= n;
+
+    // O_intra = A @ V, O_cross = Q @ S_prev, O = O_intra + O_cross
+    n = snprintf(p, rem,
+        "    tensor<fp16, [1, %d, %d, %d]> Oi = matmul(transpose_x = bF, transpose_y = bF, x = A, y = V)[name = string(\"Oi\")];\n"
+        "    tensor<fp16, [1, %d, %d, %d]> Oc = matmul(transpose_x = bF, transpose_y = bF, x = Q, y = Sp)[name = string(\"Oc\")];\n"
+        "    tensor<fp16, [1, %d, %d, %d]> O = add(x = Oi, y = Oc)[name = string(\"O\")];\n",
+        H, C, D, H, C, D, H, C, D);
+    p += n; rem -= n;
+
+    // Output: concat O[H,C,D] + S_next[H,D,D] along dim3
+    n = snprintf(p, rem,
+        "    tensor<int32, [4]> rof = const()[name = string(\"rof\"), val = tensor<int32, [4]>([1, %d, 1, %d])];\n"
+        "    tensor<fp16, [1, %d, 1, %d]> Of = reshape(shape = rof, x = O)[name = string(\"Of\")];\n"
+        "    tensor<int32, [4]> rsf = const()[name = string(\"rsf\"), val = tensor<int32, [4]>([1, %d, 1, %d])];\n"
+        "    tensor<fp16, [1, %d, 1, %d]> Sf = reshape(shape = rsf, x = Sn)[name = string(\"Sf\")];\n"
+        "    int32 cd = const()[name = string(\"cd\"), val = int32(3)];\n"
+        "    tensor<fp16, [1, %d, 1, %d]> y = concat(values = (Of, Sf), axis = cd, interleave = bF)[name = string(\"y\")];\n"
+        "  } -> (y);\n}\n",
+        H, C*D, H, C*D,
+        H, D*D, H, D*D,
+        H, sp_out);
+    p += n;
+
+    *out_len = (size_t)(p - mil);
+    return mil;
+}
+
+static ANEKernelHandle *compile_ane_chunk(int H, int C, int D, float g) {
+    size_t mil_len;
+    char *mil = gen_fused_chunk(H, C, D, g, &mil_len);
+    int sp_in = 3*C*D + D*D + C*C;
+    int sp_out = C*D + D*D;
+    size_t isz = (size_t)H * sp_in * sizeof(_Float16);
+    size_t osz = (size_t)H * sp_out * sizeof(_Float16);
+    ANEKernelHandle *k = ane_bridge_compile(mil, mil_len, NULL, 0, 1, &isz, 1, &osz);
+    free(mil);
+    if (!k) fprintf(stderr, "FAILED to compile ane_chunk H=%d C=%d D=%d\n", H, C, D);
+    return k;
+}
+
+static void ane_chunk_pack(ANEKernelHandle *kernel,
+    const float *q, const float *k, const float *v, const float *state,
+    const _Float16 *mask, int base_t, int H, int C, int D, int stride)
+{
+    int DD = D * D;
+    int CD = C * D;
+    int sp_in = 3*CD + DD + C*C;
+    IOSurfaceRef inS = (IOSurfaceRef)ane_bridge_get_input_surface(kernel, 0);
+    IOSurfaceLock(inS, 0, NULL);
+    _Float16 *buf = (_Float16 *)IOSurfaceGetBaseAddress(inS);
+
+    for (int h = 0; h < H; h++) {
+        _Float16 *hb = buf + h * sp_in;
+        for (int t = 0; t < C; t++) {
+            const float *sq = q + (base_t + t) * stride + h * D;
+            const float *sk = k + (base_t + t) * stride + h * D;
+            const float *sv = v + (base_t + t) * stride + h * D;
+            _Float16 *dq = hb + t * D;
+            _Float16 *dk = hb + CD + t * D;
+            _Float16 *dv = hb + 2*CD + t * D;
+            int d = 0;
+            for (; d + 7 < D; d += 8) {
+                vst1q_f16((__fp16 *)(dq + d),
+                    vcombine_f16(vcvt_f16_f32(vld1q_f32(sq+d)), vcvt_f16_f32(vld1q_f32(sq+d+4))));
+                vst1q_f16((__fp16 *)(dk + d),
+                    vcombine_f16(vcvt_f16_f32(vld1q_f32(sk+d)), vcvt_f16_f32(vld1q_f32(sk+d+4))));
+                vst1q_f16((__fp16 *)(dv + d),
+                    vcombine_f16(vcvt_f16_f32(vld1q_f32(sv+d)), vcvt_f16_f32(vld1q_f32(sv+d+4))));
+            }
+            for (; d < D; d++) { dq[d] = (_Float16)sq[d]; dk[d] = (_Float16)sk[d]; dv[d] = (_Float16)sv[d]; }
+        }
+        const float *ss = state + h * DD;
+        _Float16 *ds = hb + 3*CD;
+        int i = 0;
+        for (; i + 7 < DD; i += 8)
+            vst1q_f16((__fp16 *)(ds + i),
+                vcombine_f16(vcvt_f16_f32(vld1q_f32(ss+i)), vcvt_f16_f32(vld1q_f32(ss+i+4))));
+        for (; i < DD; i++) ds[i] = (_Float16)ss[i];
+        memcpy(hb + 3*CD + DD, mask, (size_t)C * C * sizeof(_Float16));
+    }
+    IOSurfaceUnlock(inS, 0, NULL);
+}
+
+static void ane_chunk_unpack(ANEKernelHandle *kernel,
+    float *o, float *state, int base_t, int H, int C, int D, int stride)
+{
+    int DD = D * D;
+    int CD = C * D;
+    int sp_out = CD + DD;
+    IOSurfaceRef outS = (IOSurfaceRef)ane_bridge_get_output_surface(kernel, 0);
+    IOSurfaceLock(outS, kIOSurfaceLockReadOnly, NULL);
+    const _Float16 *obuf = (const _Float16 *)IOSurfaceGetBaseAddress(outS);
+
+    for (int h = 0; h < H; h++) {
+        const _Float16 *ho = obuf + h * sp_out;
+        for (int t = 0; t < C; t++) {
+            float *dst = o + (base_t + t) * stride + h * D;
+            const _Float16 *src = ho + t * D;
+            int d = 0;
+            for (; d + 7 < D; d += 8) {
+                float16x8_t hh = vld1q_f16((const __fp16 *)(src + d));
+                vst1q_f32(dst + d, vcvt_f32_f16(vget_low_f16(hh)));
+                vst1q_f32(dst + d + 4, vcvt_f32_f16(vget_high_f16(hh)));
+            }
+            for (; d < D; d++) dst[d] = (float)src[d];
+        }
+        float *ds = state + h * DD;
+        const _Float16 *ss = ho + CD;
+        int i = 0;
+        for (; i + 7 < DD; i += 8) {
+            float16x8_t hh = vld1q_f16((const __fp16 *)(ss + i));
+            vst1q_f32(ds + i, vcvt_f32_f16(vget_low_f16(hh)));
+            vst1q_f32(ds + i + 4, vcvt_f32_f16(vget_high_f16(hh)));
+        }
+        for (; i < DD; i++) ds[i] = (float)ss[i];
+    }
+    IOSurfaceUnlock(outS, kIOSurfaceLockReadOnly, NULL);
+}
+
+static void normalize_qk_for_chunk(float *q, float *k, int sp, int nh, int nd) {
+    for (int s = 0; s < sp; s++) {
+        for (int h = 0; h < nh; h++) {
+            float *qh = q + s * nh * nd + h * nd;
+            float *kh = k + s * nh * nd + h * nd;
+            float32x4_t vqn = vdupq_n_f32(0), vkn = vdupq_n_f32(0);
+            for (int d = 0; d < nd; d += 4) {
+                float32x4_t vq = vld1q_f32(qh + d);
+                float32x4_t vk = vld1q_f32(kh + d);
+                vqn = vfmaq_f32(vqn, vq, vq);
+                vkn = vfmaq_f32(vkn, vk, vk);
+            }
+            float q_inv = 1.0f / (sqrtf(vaddvq_f32(vqn)) + 1e-8f) / sqrtf((float)nd);
+            float k_inv = 1.0f / (sqrtf(vaddvq_f32(vkn)) + 1e-8f);
+            float32x4_t vqi = vdupq_n_f32(q_inv), vki = vdupq_n_f32(k_inv);
+            for (int d = 0; d < nd; d += 4) {
+                vst1q_f32(qh + d, vmulq_f32(vld1q_f32(qh + d), vqi));
+                vst1q_f32(kh + d, vmulq_f32(vld1q_f32(kh + d), vki));
+            }
+        }
+    }
+}
+
+static void ane_deltanet_recurrence(ANEKernelHandle *kernel,
+    float *q, float *k, float *v, float *state, float *o,
+    const _Float16 *mask, int sp, int H, int D, int C)
+{
+    int stride = H * D;
+    int n_sub = sp / C;
+    for (int sc = 0; sc < n_sub; sc++) {
+        ane_chunk_pack(kernel, q, k, v, state, mask, sc * C, H, C, D, stride);
+        ane_bridge_eval(kernel);
+        ane_chunk_unpack(kernel, o, state, sc * C, H, C, D, stride);
+    }
+}
+
 // ── ANE FFN (dynamic weights, all FP16) ──
 // Conv1x1 FFN kernels — 4× faster than matmul MIL path
 static ANEKernelHandle *ffn_k_conv = NULL;        // gate/up A: [ic=DIM, oc=INTER, sp=CHUNK]
@@ -1555,8 +2636,7 @@ int main(int argc, char **argv) {
         }
         const char *gguf_path = argv[1];
         int S = (argc > 2) ? atoi(argv[2]) : 256;
-        int CHUNK = 256;
-        if (S < CHUNK) CHUNK = S;
+        if (S < CHUNK) S = CHUNK;
         int n_chunks = S / CHUNK;
 
         // Detect chip
@@ -1593,7 +2673,7 @@ int main(int argc, char **argv) {
 
         // ─── Compile ANE kernels ───
         ANEKernelHandle *k_proj_qkv = NULL, *k_proj_gate = NULL, *k_proj_ssm_out = NULL;
-        ANEKernelHandle *k_proj_attn_q = NULL, *k_proj_kv = NULL, *k_proj_kv_B = NULL;
+        // k_proj_attn_q, k_proj_kv, k_proj_kv_B replaced by k_fused_qkv
         ANEKernelHandle *k_proj_attn_o = NULL;
 
         printf("Compiling ANE kernels...\n");
@@ -1604,11 +2684,9 @@ int main(int argc, char **argv) {
         k_proj_qkv     = compile_dyn_proj(DIM, CONV_DIM, CHUNK);
         k_proj_gate    = compile_dyn_proj(DIM, SSM_INNER, CHUNK);
         k_proj_ssm_out = compile_dyn_proj(SSM_INNER, DIM, CHUNK);
-        k_proj_attn_q  = compile_dyn_proj(DIM, ATTN_Q_PROJ, CHUNK);
-        k_proj_kv      = compile_dyn_proj(DIM, KV_DIM, CHUNK);
-        k_proj_kv_B    = compile_dyn_proj(DIM, KV_DIM, CHUNK);
+        ANEKernelHandle *k_fused_qkv = compile_fused_qkv(DIM, Q_DIM, KV_DIM, CHUNK);
         k_proj_attn_o  = compile_dyn_proj(Q_DIM, DIM, CHUNK);
-        compile_count = 7;
+        compile_count = 5;
 
         ffn_k_conv = compile_dyn_conv(DIM, INTER, CHUNK);
         ffn_k_conv_B = compile_dyn_conv(DIM, INTER, CHUNK);
@@ -1625,9 +2703,18 @@ int main(int argc, char **argv) {
         ffn_up_out     = (_Float16 *)malloc((size_t)INTER * CHUNK * 2);
         ffn_down_accum = (_Float16 *)calloc((size_t)DIM * CHUNK, 2);
 
-        printf("  %d kernels compiled in %.0f ms (6 proj + %d FFN conv)\n",
+        // Fused causal attention kernel (replaces CPU BLAS attention)
+        k_fused_sdpa = compile_fused_sdpa(ATTN_HQ, ATTN_HKV, ATTN_HD, CHUNK);
+        compile_count++;
+
+        // Chunkwise DeltaNet recurrence kernel (replaces CPU sequential recurrence)
+        k_ane_chunk = compile_ane_chunk(DN_H, CHUNK_C, DN_D, DN_DECAY);
+        g_decay_mask = precompute_decay_mask(CHUNK_C, DN_DECAY);
+        compile_count++;
+
+        printf("  %d kernels compiled in %.0f ms (5 proj + %d FFN + 1 SDPA + 1 chunk)\n",
                compile_count, ticks_to_ms(mach_absolute_time() - t0),
-               compile_count - 6);
+               compile_count - 7);
 
         // Start staging pipeline thread
         pthread_t pipe_tid;
@@ -1757,6 +2844,22 @@ int main(int argc, char **argv) {
         }
         printf("  F32 params loaded in %.0f ms\n", ticks_to_ms(mach_absolute_time() - t0));
 
+        // Compile per-layer fused QKV+SDPA kernels (norm weights baked as BLOBFILE)
+#ifndef DISABLE_FUSED_QKV_SDPA
+        {
+            printf("\nCompiling %d fused QKV+SDPA kernels (per-layer norm weights)...\n", N_ATTN);
+            t0 = mach_absolute_time();
+            int fused_ok = 0;
+            for (int ai = 0; ai < N_ATTN; ai++) {
+                k_fused_qkv_sdpa[ai] = compile_fused_qkv_sdpa_kern(
+                    q_norm_w[ai], k_norm_w[ai]);
+                if (k_fused_qkv_sdpa[ai]) fused_ok++;
+            }
+            printf("  %d/%d fused QKV+SDPA kernels compiled in %.0f ms\n",
+                   fused_ok, N_ATTN, ticks_to_ms(mach_absolute_time() - t0));
+        }
+#endif
+
         // ─── Initialize hidden state from embedding ───
         printf("\nInitializing embeddings...\n");
         {
@@ -1811,6 +2914,7 @@ int main(int argc, char **argv) {
         for (int l = 0; l < N_LAYERS; l++) is_attn[l] = is_attn_layer(l);
 
         double total_ane_proj_ms = 0, total_ane_ffn_ms = 0;
+        double total_ane_sdpa_ms = 0, total_ane_rec_ms = 0;
         double total_cpu_norm_ms = 0, total_cpu_rec_ms = 0, total_cpu_attn_ms = 0;
         double total_cpu_pregate_ms = 0, total_cpu_postgate_ms = 0;
         double total_dequant_ms = 0, total_cpu_ffn_ms = 0;
@@ -1826,7 +2930,7 @@ int main(int argc, char **argv) {
 
         // Double-buffered weight prefetch: dequant layer L+1 while layer L runs on ANE.
         typedef struct {
-            PreTransW proj[4];
+            PreTransW proj[5];
             PreTransW ffn[3];
         } LayerWeights;
 
@@ -1841,14 +2945,23 @@ int main(int argc, char **argv) {
                 snprintf(name, 256, "blk.%d.ssm_out.weight", layer);
                 predequant_gguf(&lw->proj[2], g, name, DIM, SSM_INNER, tmp);
             } else {
+                // Dequant full Q weight then deinterleave into Q-only + gate-only
                 snprintf(name, 256, "blk.%d.attn_q.weight", layer);
-                predequant_gguf(&lw->proj[0], g, name, ATTN_Q_PROJ, DIM, tmp);
+                PreTransW pw_full;
+                predequant_gguf(&pw_full, g, name, ATTN_Q_PROJ, DIM, tmp);
+                lw->proj[0].ic = DIM; lw->proj[0].oc = Q_DIM;
+                lw->proj[0].data = (_Float16 *)malloc((size_t)DIM * Q_DIM * 2);
+                lw->proj[1].ic = DIM; lw->proj[1].oc = Q_DIM;
+                lw->proj[1].data = (_Float16 *)malloc((size_t)DIM * Q_DIM * 2);
+                deinterleave_q_weight(pw_full.data, lw->proj[0].data, lw->proj[1].data,
+                                       DIM, ATTN_Q_PROJ, ATTN_HQ, ATTN_HD);
+                free(pw_full.data);
                 snprintf(name, 256, "blk.%d.attn_k.weight", layer);
-                predequant_gguf(&lw->proj[1], g, name, KV_DIM, DIM, tmp);
-                snprintf(name, 256, "blk.%d.attn_v.weight", layer);
                 predequant_gguf(&lw->proj[2], g, name, KV_DIM, DIM, tmp);
+                snprintf(name, 256, "blk.%d.attn_v.weight", layer);
+                predequant_gguf(&lw->proj[3], g, name, KV_DIM, DIM, tmp);
                 snprintf(name, 256, "blk.%d.attn_output.weight", layer);
-                predequant_gguf(&lw->proj[3], g, name, DIM, Q_DIM, tmp);
+                predequant_gguf(&lw->proj[4], g, name, DIM, Q_DIM, tmp);
             }
             snprintf(name, 256, "blk.%d.ffn_gate.weight", layer);
             predequant_gguf(&lw->ffn[0], g, name, INTER, DIM, tmp);
@@ -1859,7 +2972,7 @@ int main(int argc, char **argv) {
         };
 
         static void (^free_layer_weights)(LayerWeights *) = ^(LayerWeights *lw) {
-            for (int i = 0; i < 4; i++) predequant_free(&lw->proj[i]);
+            for (int i = 0; i < 5; i++) predequant_free(&lw->proj[i]);
             for (int i = 0; i < 3; i++) predequant_free(&lw->ffn[i]);
         };
 
@@ -1904,6 +3017,8 @@ int main(int argc, char **argv) {
             }
 
             LayerWeights *lw = &lw_buf[cur_buf];
+            // DN layers: proj[0]=qkv, proj[1]=gate, proj[2]=ssm_out (3 used)
+            // Attn layers: proj[0]=Wq, proj[1]=Wgate, proj[2]=Wk, proj[3]=Wv, proj[4]=Wo (5 used)
             PreTransW *pw_proj1 = &lw->proj[0], *pw_proj2 = &lw->proj[1],
                       *pw_proj3 = &lw->proj[2], *pw_proj4 = &lw->proj[3];
 
@@ -1985,11 +3100,11 @@ int main(int argc, char **argv) {
                     memcpy(dn_z_buf, gz_buf, (size_t)SSM_INNER * CHUNK * sizeof(float));
 
                     tl = mach_absolute_time();
-                    blas_deltanet_recurrence_v2(dn_q_buf, dn_k_buf, dn_v_buf,
-                                                dn_beta, dn_g,
-                                                dn_states[local_dn], o_buf, dn_tmp,
-                                                CHUNK, DN_H, DN_D);
-                    total_cpu_rec_ms += ticks_to_ms(mach_absolute_time() - tl);
+                    normalize_qk_for_chunk(dn_q_buf, dn_k_buf, CHUNK, DN_H, DN_D);
+                    ane_deltanet_recurrence(k_ane_chunk, dn_q_buf, dn_k_buf, dn_v_buf,
+                                            dn_states[local_dn], o_buf,
+                                            g_decay_mask, CHUNK, DN_H, DN_D, CHUNK_C);
+                    total_ane_rec_ms += ticks_to_ms(mach_absolute_time() - tl);
 
                     tl = mach_absolute_time();
                     cpu_deltanet_post_gates(o_buf, dn_z_buf, dn_norm_o[local_dn],
@@ -2003,81 +3118,98 @@ int main(int argc, char **argv) {
 
                 } else {
                     // ═══════════════════════════════════════════
-                    // Attention Layer — pipelined Q→K→V
+                    // Attention Layer
                     // ═══════════════════════════════════════════
-                    tl = mach_absolute_time();
-                    {
-                        uint64_t _ts = mach_absolute_time();
-                        fast_stage(k_proj_attn_q, pw_proj1, normed_f16, CHUNK);
-                        total_proj_stage_ms += ticks_to_ms(mach_absolute_time() - _ts);
-
-                        // Overlap: stage K during Q eval
-                        pipe_async_fast(k_proj_kv, pw_proj2, normed_f16, CHUNK);
-                        _ts = mach_absolute_time();
-                        ane_bridge_eval(k_proj_attn_q);
-                        total_proj_eval_ms += ticks_to_ms(mach_absolute_time() - _ts);
-
-                        _ts = mach_absolute_time();
-                        ane_read_output(k_proj_attn_q, attn_q_raw, ATTN_Q_PROJ, CHUNK);
-                        total_proj_read_ms += ticks_to_ms(mach_absolute_time() - _ts);
-                        proj_dispatch_count++;
-
-                        _ts = mach_absolute_time();
-                        pipe_wait();
-                        total_proj_stage_ms += ticks_to_ms(mach_absolute_time() - _ts);
-
-                        // Overlap: stage V into kv_B during K eval
-                        pipe_async_fast(k_proj_kv_B, pw_proj3, normed_f16, CHUNK);
-                        _ts = mach_absolute_time();
-                        ane_bridge_eval(k_proj_kv);
-                        total_proj_eval_ms += ticks_to_ms(mach_absolute_time() - _ts);
-
-                        _ts = mach_absolute_time();
-                        ane_read_output(k_proj_kv, attn_k, KV_DIM, CHUNK);
-                        total_proj_read_ms += ticks_to_ms(mach_absolute_time() - _ts);
-                        proj_dispatch_count++;
-
-                        _ts = mach_absolute_time();
-                        pipe_wait();
-                        total_proj_stage_ms += ticks_to_ms(mach_absolute_time() - _ts);
-
-                        _ts = mach_absolute_time();
-                        ane_bridge_eval(k_proj_kv_B);
-                        total_proj_eval_ms += ticks_to_ms(mach_absolute_time() - _ts);
-
-                        _ts = mach_absolute_time();
-                        ane_read_output(k_proj_kv_B, attn_v, KV_DIM, CHUNK);
-                        total_proj_read_ms += ticks_to_ms(mach_absolute_time() - _ts);
-                        proj_dispatch_count++;
-                    }
-                    total_ane_proj_ms += ticks_to_ms(mach_absolute_time() - tl);
-
-                    tl = mach_absolute_time();
-                    cpu_attn_deinterleave(attn_q_raw, attn_q, attn_gate, CHUNK);
-                    cpu_qk_rmsnorm(attn_q, attn_k, q_norm_w[local_attn],
-                                    k_norm_w[local_attn], CHUNK);
-                    cpu_rope(attn_q, attn_k, CHUNK, pos, 1e7);
-
-                    float *kv = kv_caches[local_attn];
-                    float *k_cache = kv;
-                    float *v_cache = kv + S * KV_DIM;
-                    for (int s = 0; s < CHUNK; s++) {
-                        int t = pos + s;
-                        memcpy(k_cache + t * KV_DIM, attn_k + s * KV_DIM, KV_DIM * sizeof(float));
-                        memcpy(v_cache + t * KV_DIM, attn_v + s * KV_DIM, KV_DIM * sizeof(float));
-                    }
-                    total_cpu_attn_ms += ticks_to_ms(mach_absolute_time() - tl);
+                    PreTransW *pw_attn_q = &lw->proj[0], *pw_attn_gate = &lw->proj[1],
+                              *pw_attn_k = &lw->proj[2], *pw_attn_v = &lw->proj[3],
+                              *pw_attn_o = &lw->proj[4];
 
                     int kv_len = pos + CHUNK;
-                    tl = mach_absolute_time();
-                    cpu_causal_attention(attn_q, k_cache, v_cache, attn_out,
-                                         attn_scores, CHUNK, kv_len, pos);
-                    cpu_attn_output_gate(attn_out, attn_gate, CHUNK);
-                    total_cpu_attn_ms += ticks_to_ms(mach_absolute_time() - tl);
+
+                    ANEKernelHandle *fused_k = k_fused_qkv_sdpa[local_attn];
+                    if (fused_k && kv_len <= CHUNK) {
+                        // ── Fully fused: QKV proj + QK norm + RoPE + SDPA ──
+                        tl = mach_absolute_time();
+                        fast_stage_fused_qkv_sdpa(fused_k,
+                            pw_attn_q, pw_attn_gate, pw_attn_k, pw_attn_v,
+                            normed_f16, CHUNK);
+                        total_proj_stage_ms += ticks_to_ms(mach_absolute_time() - tl);
+
+                        tl = mach_absolute_time();
+                        bool eval_ok = ane_bridge_eval(fused_k);
+                        total_proj_eval_ms += ticks_to_ms(mach_absolute_time() - tl);
+                        total_ane_sdpa_ms += ticks_to_ms(mach_absolute_time() - tl);
+
+                        if (!eval_ok) {
+                            fprintf(stderr, "WARN: fused QKV+SDPA eval failed for attn layer %d, falling back\n", local_attn);
+                            goto fallback_attn;
+                        }
+
+                        tl = mach_absolute_time();
+                        read_fused_qkv_sdpa_output(fused_k,
+                            attn_out, attn_gate, Q_DIM, CHUNK);
+                        total_proj_read_ms += ticks_to_ms(mach_absolute_time() - tl);
+                        proj_dispatch_count++;
+
+                        tl = mach_absolute_time();
+                        cpu_attn_output_gate(attn_out, attn_gate, CHUNK);
+                        total_cpu_attn_ms += ticks_to_ms(mach_absolute_time() - tl);
+                    } else {
+                    fallback_attn:
+                        // ── Fallback: separate QKV + CPU norm/rope + SDPA ──
+                        tl = mach_absolute_time();
+                        {
+                            uint64_t _ts = mach_absolute_time();
+                            fast_stage_fused_qkv(k_fused_qkv, pw_attn_q, pw_attn_gate,
+                                                  pw_attn_k, pw_attn_v, normed_f16, CHUNK);
+                            total_proj_stage_ms += ticks_to_ms(mach_absolute_time() - _ts);
+
+                            _ts = mach_absolute_time();
+                            ane_bridge_eval(k_fused_qkv);
+                            total_proj_eval_ms += ticks_to_ms(mach_absolute_time() - _ts);
+
+                            _ts = mach_absolute_time();
+                            read_fused_qkv_output(k_fused_qkv, attn_q, attn_gate,
+                                                   attn_k, attn_v, Q_DIM, KV_DIM, CHUNK);
+                            total_proj_read_ms += ticks_to_ms(mach_absolute_time() - _ts);
+                            proj_dispatch_count++;
+                        }
+                        total_ane_proj_ms += ticks_to_ms(mach_absolute_time() - tl);
+
+                        tl = mach_absolute_time();
+                        cpu_qk_rmsnorm(attn_q, attn_k, q_norm_w[local_attn],
+                                        k_norm_w[local_attn], CHUNK);
+                        cpu_rope(attn_q, attn_k, CHUNK, pos, 1e7);
+
+                        float *kv = kv_caches[local_attn];
+                        float *k_cache = kv;
+                        float *v_cache = kv + S * KV_DIM;
+                        for (int s = 0; s < CHUNK; s++) {
+                            int t = pos + s;
+                            memcpy(k_cache + t * KV_DIM, attn_k + s * KV_DIM, KV_DIM * sizeof(float));
+                            memcpy(v_cache + t * KV_DIM, attn_v + s * KV_DIM, KV_DIM * sizeof(float));
+                        }
+                        total_cpu_attn_ms += ticks_to_ms(mach_absolute_time() - tl);
+
+                        tl = mach_absolute_time();
+                        if (k_fused_sdpa && kv_len <= CHUNK) {
+                            stage_fused_sdpa(k_fused_sdpa, attn_q, attn_k, attn_v, CHUNK);
+                            ane_bridge_eval(k_fused_sdpa);
+                            ane_read_output(k_fused_sdpa, attn_out, Q_DIM, CHUNK);
+                            total_ane_sdpa_ms += ticks_to_ms(mach_absolute_time() - tl);
+                        } else {
+                            cpu_causal_attention(attn_q, k_cache, v_cache, attn_out,
+                                                 attn_scores, CHUNK, kv_len, pos);
+                            total_cpu_attn_ms += ticks_to_ms(mach_absolute_time() - tl);
+                        }
+                        tl = mach_absolute_time();
+                        cpu_attn_output_gate(attn_out, attn_gate, CHUNK);
+                        total_cpu_attn_ms += ticks_to_ms(mach_absolute_time() - tl);
+                    }
 
                     tl = mach_absolute_time();
                     transpose_to_f16(attn_out_f16_buf, attn_out, CHUNK, Q_DIM);
-                    PROJ_DISPATCH(k_proj_attn_o, pw_proj4, attn_out_f16_buf, proj_out, DIM, CHUNK);
+                    PROJ_DISPATCH(k_proj_attn_o, pw_attn_o, attn_out_f16_buf, proj_out, DIM, CHUNK);
                     total_ane_proj_ms += ticks_to_ms(mach_absolute_time() - tl);
                 }
 
@@ -2144,6 +3276,8 @@ int main(int argc, char **argv) {
         printf("    silu:  %.0f ms\n", ffn_t_silu);
         printf("    down:  stg=%.0f eval=%.0f rd=%.0f\n", ffn_t_down_stage, ffn_t_down_eval, ffn_t_down_read);
         printf("    xpose: %.0f ms\n", ffn_t_transpose);
+        printf("  ANE SDPA:     %.0f ms\n", total_ane_sdpa_ms);
+        printf("  ANE recur:    %.0f ms\n", total_ane_rec_ms);
         printf("  CPU norm:     %.0f ms\n", total_cpu_norm_ms);
         printf("  CPU recur:    %.0f ms\n", total_cpu_rec_ms);
         printf("  CPU attn:     %.0f ms\n", total_cpu_attn_ms);
@@ -2153,7 +3287,8 @@ int main(int argc, char **argv) {
         printf("  Dequant:      %.0f ms\n", total_dequant_ms);
         printf("  Transpose:    %.0f ms\n", total_transpose_ms);
         printf("  Staging:      %.0f ms\n", total_staging_ms);
-        double accounted = total_ane_proj_ms + total_ane_ffn_ms + total_cpu_norm_ms +
+        double accounted = total_ane_proj_ms + total_ane_ffn_ms +
+            total_ane_sdpa_ms + total_ane_rec_ms + total_cpu_norm_ms +
             total_cpu_rec_ms + total_cpu_attn_ms + total_cpu_pregate_ms +
             total_cpu_postgate_ms + total_cpu_ffn_ms + total_transpose_ms;
         printf("  Other:        %.0f ms\n", pipeline_ms - accounted);

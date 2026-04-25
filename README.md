@@ -2,15 +2,17 @@
 
 Standalone benchmark that runs the full Qwen 3.5 27B (64 layers, 48 DeltaNet + 16 Attention) prefill pipeline entirely on the Apple Neural Engine. No ML frameworks, no Python — just Objective-C talking directly to ANE private APIs.
 
-**What it does:** Loads a GGUF model, dequantizes Q4K/Q5K/Q6K weights per-layer to FP16, and dispatches all projections + FFN through ANE conv1x1 kernels with pipelined DMA/compute staging. DeltaNet recurrence and causal attention run on CPU via Accelerate/BLAS.
+**What it does:** Loads a GGUF model, dequantizes Q4K/Q5K/Q6K weights per-layer to FP16, and dispatches all projections + FFN through ANE conv1x1 kernels with pipelined DMA/compute staging. Attention layers use a fully fused ANE graph (QKV projection + QK RMSNorm + RoPE + causal SDPA in a single MIL dispatch). DeltaNet recurrence runs on CPU via Accelerate.
 
 ## Results (M4, 10 cores, 24 GB)
 
 | Seq Len | tok/s | TTFT |
 |---------|-------|------|
-| 256 | 20.2 | 12.7s |
+| 256 | 19.1 | 13.4s |
 | 512 | 24.3 | 21.1s |
 | 1024 | 27.8 | 36.8s |
+
+At S=256 the fused attention path adds 8s one-time compile (16 per-layer kernels with baked norm weights). At S>=512 the pipeline falls back to separate dispatches since KV length exceeds chunk size. Disable fused path with `-DDISABLE_FUSED_QKV_SDPA` if needed.
 
 **Want to see what M4 Pro / Max / Ultra / M5 can do?** Run the benchmark and share your numbers.
 
@@ -47,19 +49,24 @@ For longer sequences:
 
 ```
 ═══════════════════════════════════════════════════════════════
-  ANE Prefill Benchmark — Qwen 3.5 27B
+  ANE Prefill Benchmark — Qwen 3.6 27B
   Chip: Apple M4 (10 cores, 24 GB)
   S=256, CHUNK=256, 64 layers (48 DN + 16 Attn)
 ═══════════════════════════════════════════════════════════════
 
 Compiling ANE kernels...
-  12 kernels compiled in 50 ms
+  12 kernels compiled in 55 ms
 
-  Total: 12695 ms → 20.2 tok/s (S=256)
-  ANE proj:     3282 ms  (208 dispatches)
-  ANE FFN:      4390 ms
-  CPU attn:     1397 ms
-  CPU recur:    745 ms
+Compiling 16 fused QKV+SDPA kernels (per-layer norm weights)...
+  16/16 fused QKV+SDPA kernels compiled in 8184 ms
+
+  Total: 13397 ms → 19.1 tok/s (S=256)
+  ANE proj:     2864 ms  (176 dispatches)
+  ANE FFN:      5224 ms
+  ANE SDPA:     403 ms   (fused QKV+norm+RoPE+SDPA)
+  ANE recur:    733 ms
+  CPU norm:     250 ms
+  CPU attn:     158 ms   (output gate only)
 ```
 
 ## Requirements
@@ -75,17 +82,35 @@ Compiling ANE kernels...
 The pipeline runs per-layer:
 
 ```
-RMSNorm (CPU) → Projections (ANE conv1x1) → Recurrence/Attention (CPU)
-  → O_proj (ANE) → Residual (CPU) → RMSNorm (CPU) → Fused FFN (ANE) → Residual (CPU)
+DeltaNet layers:
+  RMSNorm (CPU) → Projections (ANE conv1x1) → Chunkwise Recurrence (ANE)
+    → O_proj (ANE) → Residual (CPU) → RMSNorm (CPU) → Fused FFN (ANE) → Residual (CPU)
+
+Attention layers (fused path, S<=CHUNK):
+  RMSNorm (CPU) → [QKV proj + QK RMSNorm + RoPE + Causal SDPA] (single ANE graph)
+    → Output gate (CPU) → O_proj (ANE) → Residual → FFN (ANE) → Residual
+
+Attention layers (fallback, S>CHUNK):
+  RMSNorm (CPU) → Fused QKV proj (ANE) → QK norm + RoPE (CPU) → SDPA (ANE)
+    → Output gate (CPU) → O_proj (ANE) → Residual → FFN (ANE) → Residual
 ```
 
 Key techniques:
+- **Fused attention graph** — single 33KB MIL program with 4 matmuls + 28-head RMSNorm (pow -0.5) + partial RoPE + GQA + causal SDPA, compiled per-layer with norm weights baked as BLOBFILE constants
 - **Zero-copy output reads** — read ANE output IOSurface directly with NEON transpose, no intermediate buffer
 - **Pipelined DMA/compute** — pthread stages next kernel's weights while current ANE eval runs (double-buffered kernels)
 - **Adaptive parallel staging** — blocked dispatch_apply for large IOSurface copies (>4 MB)
 - **K-tiled down projection** — [17408→5120] split into 2048-channel tiles with zero-copy NEON accumulation
+- **Chunkwise DeltaNet recurrence** — fused 4-matmul chunk kernel on ANE (9x vs CPU)
 
-ANE access is through `_ANEInMemoryModel` private APIs (see `ane_bridge.m`). MIL graphs are generated at runtime for each unique projection shape, compiled once, and reused across all 64 layers.
+ANE access is through `_ANEInMemoryModel` private APIs (see `ane_bridge.m`). MIL graphs are generated at runtime, compiled once per shape (projections/FFN) or per layer (fused attention with baked norm weights), and reused across tokens.
+
+### ANE constraints discovered
+- `rsqrt` MIL op fails at compile — use `pow(x, -0.5)` instead
+- `inverse` MIL op fails — use `real_div(1, x)` instead
+- `attn_mask` parameter is ignored by hardware — use BLOBFILE const mask + element-wise add
+- Input spatial dim 14593-14622 triggers eval failure (0x1d) with complex graphs — keep at 14592 or jump to 14624
+- `weightsBuffer` IOSurface is ignored by hardware — pack weights in input spatial dim instead
 
 ## Sharing Results
 
