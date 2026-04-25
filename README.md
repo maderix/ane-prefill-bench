@@ -1,6 +1,6 @@
-# ANE Prefill Benchmark — Qwen 3.6 27B on Apple Neural Engine
+# ANE Prefill Benchmark — Qwen 3.5 27B on Apple Neural Engine
 
-Standalone benchmark that runs the full Qwen 3.6 27B (30B-A3B MoE, 64 layers) prefill pipeline entirely on the Apple Neural Engine. No ML frameworks, no Python — just Objective-C talking directly to ANE private APIs.
+Standalone benchmark that runs the full Qwen 3.5 27B (64 layers, 48 DeltaNet + 16 Attention) prefill pipeline entirely on the Apple Neural Engine. No ML frameworks, no Python — just Objective-C talking directly to ANE private APIs.
 
 **What it does:** Loads a GGUF model, dequantizes Q4K/Q5K/Q6K weights per-layer to FP16, and dispatches all projections + FFN through ANE conv1x1 kernels with pipelined DMA/compute staging. DeltaNet recurrence and causal attention run on CPU via Accelerate/BLAS.
 
@@ -47,7 +47,7 @@ For longer sequences:
 
 ```
 ═══════════════════════════════════════════════════════════════
-  ANE Prefill Benchmark — Qwen 3.6 27B
+  ANE Prefill Benchmark — Qwen 3.5 27B
   Chip: Apple M4 (10 cores, 24 GB)
   S=256, CHUNK=256, 64 layers (48 DN + 16 Attn)
 ═══════════════════════════════════════════════════════════════
